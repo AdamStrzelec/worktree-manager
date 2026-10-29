@@ -1,0 +1,484 @@
+#!/usr/bin/env bash
+# wt - git worktree manager. Isolates parallel work; returns to base via `wt merge`.
+# Compatible with bash 3.2 (macOS default): no mapfile, no assoc arrays, no ${var,,}.
+# DEFAULT_* and SRC_* are read indirectly via eval on fixed key names (load_config, cmd_config).
+# shellcheck disable=SC2034
+set -uo pipefail
+
+# ---------------------------------------------------------------- output ----
+
+die() {
+  printf 'wt: %s\n' "$*" >&2
+  exit 1
+}
+
+info() {
+  printf '%s\n' "$*"
+}
+
+# --------------------------------------------------------------- config -----
+
+# Keys a repo-tracked .wt.conf may set. Everything else needs a trusted source
+# (.git/wt.conf, global config, env) because WT_TEST / WT_POST_NEW run commands.
+SAFE_KEYS=" WT_DIR WT_BASE WT_LINK "
+ALL_KEYS="WT_DIR WT_BASE WT_LINK WT_TEST WT_POST_NEW"
+
+# Built-in defaults.
+DEFAULT_WT_DIR=".claude/worktrees"
+DEFAULT_WT_BASE=""
+DEFAULT_WT_LINK=".env .venv"
+DEFAULT_WT_TEST=""
+DEFAULT_WT_POST_NEW=""
+
+# Effective values and their origin, filled by load_config.
+CFG_WT_DIR="" CFG_WT_BASE="" CFG_WT_LINK="" CFG_WT_TEST="" CFG_WT_POST_NEW=""
+SRC_WT_DIR="" SRC_WT_BASE="" SRC_WT_LINK="" SRC_WT_TEST="" SRC_WT_POST_NEW=""
+
+# set_cfg KEY VALUE SOURCE - assign without eval (value stays plain text).
+set_cfg() {
+  case "$1" in
+    WT_DIR)      CFG_WT_DIR=$2;      SRC_WT_DIR=$3 ;;
+    WT_BASE)     CFG_WT_BASE=$2;     SRC_WT_BASE=$3 ;;
+    WT_LINK)     CFG_WT_LINK=$2;     SRC_WT_LINK=$3 ;;
+    WT_TEST)     CFG_WT_TEST=$2;     SRC_WT_TEST=$3 ;;
+    WT_POST_NEW) CFG_WT_POST_NEW=$2; SRC_WT_POST_NEW=$3 ;;
+  esac
+}
+
+# parse_conf FILE SOURCE TRUSTED(1|0) - read KEY=value lines, never source the file.
+parse_conf() {
+  local file=$1 source_name=$2 trusted=$3 line key val
+  [ -f "$file" ] || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in ''|'#'*) continue ;; esac
+    case "$line" in *=*) ;; *) continue ;; esac
+    key=${line%%=*}
+    val=${line#*=}
+    key=${key//[[:space:]]/}
+    # Strip one pair of surrounding quotes.
+    case "$val" in
+      \"*\") val=${val#\"}; val=${val%\"} ;;
+      \'*\') val=${val#\'}; val=${val%\'} ;;
+    esac
+    case " $ALL_KEYS " in *" $key "*) ;; *) continue ;; esac
+    if [ "$trusted" != 1 ]; then
+      case "$SAFE_KEYS" in *" $key "*) ;; *)
+        info "wt: pomijam $key w $file (niezaufane źródło)" >&2
+        continue ;;
+      esac
+    fi
+    set_cfg "$key" "$val" "$source_name"
+  done < "$file"
+}
+
+# load_config - precedence: env > .git/wt.conf > .wt.conf > global > default.
+load_config() {
+  local key def env_val
+  for key in $ALL_KEYS; do
+    eval "def=\$DEFAULT_$key"
+    set_cfg "$key" "$def" "domyślna"
+  done
+  parse_conf "${XDG_CONFIG_HOME:-$HOME/.config}/wt/config" "global" 1
+  if [ -n "${MAIN:-}" ]; then
+    parse_conf "$MAIN/.wt.conf" "repo (.wt.conf)" 0
+    parse_conf "$MAIN/.git/wt.conf" "repo (.git/wt.conf)" 1
+  fi
+  for key in $ALL_KEYS; do
+    # Indirect read of an env var by name; only fixed keys from ALL_KEYS reach here.
+    env_val=${!key-}
+    if [ -n "$env_val" ]; then
+      set_cfg "$key" "$env_val" "env"
+    fi
+  done
+}
+
+# ------------------------------------------------------------ repo / git ----
+
+MAIN=""
+BASE=""
+WT_ROOT=""
+
+# repo_main - set MAIN to the main checkout, also when called from a worktree.
+repo_main() {
+  local common
+  git rev-parse --git-dir >/dev/null 2>&1 || die "nie jesteś w repo git"
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || common=$(cd "$(git rev-parse --git-common-dir)" && pwd -P)
+  [ "$(git -C "$common" rev-parse --is-bare-repository 2>/dev/null)" = true ] \
+    && die "repo bare nie jest obsługiwane"
+  MAIN=${common%/.git}
+  [ -d "$MAIN" ] || die "nie znaleziono głównego checkoutu: $MAIN"
+}
+
+# base_branch - WT_BASE, else main, else master, else current branch of MAIN.
+base_branch() {
+  local b
+  if [ -n "$CFG_WT_BASE" ]; then
+    git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$CFG_WT_BASE" >/dev/null \
+      || die "gałąź bazowa '$CFG_WT_BASE' (WT_BASE) nie istnieje"
+    BASE=$CFG_WT_BASE
+    return 0
+  fi
+  for b in main master; do
+    if git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$b" >/dev/null; then
+      BASE=$b
+      return 0
+    fi
+  done
+  b=$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null) \
+    || die "brak gałęzi bazowej (repo bez commitów albo detached HEAD)"
+  BASE=$b
+}
+
+# resolve_wt_root - WT_DIR relative to MAIN (or absolute), normalized.
+resolve_wt_root() {
+  local d=$CFG_WT_DIR
+  case "$d" in
+    /*) WT_ROOT=$(norm_path "$d") ;;
+    *)  WT_ROOT=$(norm_path "$MAIN/$d") ;;
+  esac
+}
+
+# norm_path ABS - lexical normalization (collapse ., .., //); path need not exist.
+norm_path() {
+  local IFS=/ part out=""
+  set -f
+  for part in $1; do
+    case "$part" in
+      ''|.) ;;
+      ..)   out=${out%/*} ;;
+      *)    out="$out/$part" ;;
+    esac
+  done
+  set +f
+  printf '%s' "${out:-/}"
+}
+
+# valid_name NAME - dies unless NAME is a safe branch/dir name.
+valid_name() {
+  local name=$1
+  printf '%s' "$name" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._/-]*$' \
+    || die "zła nazwa '$name' (dozwolone: litery, cyfry, . _ / -)"
+  case "$name" in
+    *..*|*//*|*/|*.lock) die "zła nazwa '$name' (.., //, końcowy / lub .lock)" ;;
+  esac
+  git check-ref-format --branch "$name" >/dev/null 2>&1 \
+    || die "'$name' nie jest poprawną nazwą gałęzi"
+}
+
+# tracked_clean DIR - true when DIR has no staged/unstaged changes in tracked files.
+tracked_clean() {
+  git -C "$1" diff --quiet && git -C "$1" diff --cached --quiet
+}
+
+# json_escape STR - escape backslash and double quote.
+json_escape() {
+  local s=$1
+  s=${s//\\/\\\\}
+  s=${s//\"/\\\"}
+  printf '%s' "$s"
+}
+
+# add_exclude LINE - append LINE to the shared info/exclude once (mkdir lock, no flock on macOS).
+add_exclude() {
+  local line=$1 common file lock tries=0
+  common=$(git -C "$MAIN" rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || common="$MAIN/.git"
+  file="$common/info/exclude"
+  lock="$common/wt.lock"
+  while ! mkdir "$lock" 2>/dev/null; do
+    tries=$((tries + 1))
+    [ "$tries" -gt 50 ] && die "nie mogę zdobyć blokady $lock (usuń ją, jeśli to pozostałość)"
+    sleep 0.1
+  done
+  mkdir -p "$common/info"
+  touch "$file"
+  grep -qxF -- "$line" "$file" || printf '%s\n' "$line" >> "$file"
+  rmdir "$lock"
+}
+
+# owner_field FILE KEY - read a field from .wt-owner (flat JSON written by wt itself).
+owner_field() {
+  sed -n "s/.*\"$2\":\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\1/p" "$1" 2>/dev/null | head -1
+}
+
+# init_repo - common start for every command that needs a repo.
+init_repo() {
+  repo_main
+  load_config
+  base_branch
+  resolve_wt_root
+}
+
+# ------------------------------------------------------------- commands -----
+
+usage() {
+  local repo=""
+  if git rev-parse --git-dir >/dev/null 2>&1; then
+    repo=$(repo_main_quiet)
+  fi
+  {
+    printf 'Użycie: wt <komenda> [argumenty]\n\n'
+    printf '  new <temat>             nowy worktree i gałąź od bazy\n'
+    printf '  list | ls               tabela worktree\n'
+    printf '  status                  kolizje plików między worktree\n'
+    printf '  test [args]             testy w bieżącym worktree\n'
+    printf '  merge <temat>           testy, rebase, testy, merge --ff-only\n'
+    printf '  drop <temat> [--yes]    usuń worktree (bez --yes tylko podgląd)\n'
+    printf '  config                  efektywna konfiguracja i jej źródła\n\n'
+    printf 'Repo: %s\n' "${repo:-(poza repo git)}"
+  } >&2
+  exit 1
+}
+
+# repo_main_quiet - print main checkout path without dying (for usage).
+repo_main_quiet() {
+  local common
+  common=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null) \
+    || common=$(cd "$(git rev-parse --git-common-dir)" 2>/dev/null && pwd -P)
+  printf '%s' "${common%/.git}"
+}
+
+cmd_config() {
+  local key val src
+  init_repo
+  info "repo:  $MAIN"
+  info "baza:  $BASE"
+  info "wt:    $WT_ROOT"
+  info ""
+  printf '%-12s %-24s %s\n' KLUCZ ZRODLO WARTOSC
+  for key in $ALL_KEYS; do
+    eval "val=\$CFG_$key"
+    eval "src=\$SRC_$key"
+    printf '%-12s %-24s %s\n' "$key" "$src" "${val:-(puste)}"
+  done
+}
+
+not_implemented() {
+  die "komenda '$1' jeszcze niezaimplementowana"
+}
+
+cmd_new() {
+  [ $# -eq 1 ] || die "użycie: wt new <temat>"
+  local name=$1 path f post_rc=0 rel hash
+  init_repo
+  valid_name "$name"
+  path="$WT_ROOT/$name"
+  [ -e "$path" ] && die "ścieżka już istnieje: $path"
+  git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$name" >/dev/null \
+    && die "gałąź '$name' już istnieje"
+  if ! tracked_clean "$MAIN"; then
+    git -C "$MAIN" status --short >&2
+    die "baza ma niezacommitowane zmiany w plikach trackowanych"
+  fi
+
+  git -C "$MAIN" worktree add -q -b "$name" "$path" "$BASE" || die "git worktree add nie powiodło się"
+
+  for f in $CFG_WT_LINK; do
+    if [ -e "$MAIN/$f" ] || [ -L "$MAIN/$f" ]; then
+      if [ -e "$path/$f" ] || [ -L "$path/$f" ]; then
+        info "pomijam link $f (już istnieje w worktree)"
+      else
+        mkdir -p "$(dirname "$path/$f")"
+        ln -s "$MAIN/$f" "$path/$f"
+        # A symlink is not matched by dir-only ignore patterns (e.g. "node_modules/").
+        add_exclude "/$f"
+      fi
+    fi
+  done
+
+  printf '{"session":"%s","pid":%s,"pane":"%s","time":"%s","user":"%s"}\n' \
+    "$(json_escape "${CLAUDE_SESSION_ID:-}")" "$PPID" "$(json_escape "${TMUX_PANE:-}")" \
+    "$(date +%Y-%m-%dT%H:%M:%S%z)" "$(json_escape "${USER:-$(id -un)}")" > "$path/.wt-owner"
+
+  add_exclude ".wt-owner"
+  case "$WT_ROOT" in
+    "$MAIN"/*) rel=${WT_ROOT#"$MAIN"}; add_exclude "$rel/" ;;
+  esac
+
+  if [ -n "$CFG_WT_POST_NEW" ]; then
+    info "uruchamiam WT_POST_NEW: $CFG_WT_POST_NEW"
+    (cd "$path" && bash -c "$CFG_WT_POST_NEW") || post_rc=$?
+    [ "$post_rc" -ne 0 ] && info "UWAGA: WT_POST_NEW zakończyło się kodem $post_rc (worktree zostaje)" >&2
+  fi
+
+  hash=$(git -C "$MAIN" rev-parse --short "$BASE")
+  info "gałąź: $name (od $BASE @ $hash)"
+  info "cd $path"
+  return "$post_rc"
+}
+
+cmd_list() {
+  init_repo
+  local line wpath="" branch="" first=1 rows="" width=6
+  # Collect "path<TAB>branch" for every worktree except the main checkout.
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "worktree "*) wpath=${line#worktree }; branch="(detached)" ;;
+      "branch "*)   branch=${line#branch refs/heads/} ;;
+      "")
+        if [ -n "$wpath" ]; then
+          if [ "$first" = 1 ]; then first=0; else
+            rows="$rows$wpath	$branch
+"
+            [ "${#branch}" -gt "$width" ] && width=${#branch}
+          fi
+        fi
+        wpath="" ;;
+    esac
+  done < <(git -C "$MAIN" worktree list --porcelain; echo)
+
+  if [ -z "$rows" ]; then
+    info "brak worktree"
+    return 0
+  fi
+
+  printf "%-${width}s  %-16s  %-5s  %-6s  %s\n" GALAZ WIEK AHEAD BRUDNE WLASCICIEL
+  local p b age ahead dirty owner pid pane
+  while IFS='	' read -r p b; do
+    [ -n "$p" ] || continue
+    age=$(git -C "$p" log -1 --format=%cr 2>/dev/null || echo "?")
+    ahead=$(git -C "$MAIN" rev-list --count "$BASE..$b" 2>/dev/null || echo "?")
+    dirty=$(git -C "$p" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+    owner="wolny"
+    if [ -f "$p/.wt-owner" ]; then
+      pid=$(owner_field "$p/.wt-owner" pid)
+      pane=$(owner_field "$p/.wt-owner" pane)
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+        owner="zajęty (pid $pid${pane:+, $pane})"
+      fi
+    fi
+    printf "%-${width}s  %-16s  %-5s  %-6s  %s\n" "$b" "$age" "$ahead" "$dirty" "$owner"
+  done <<EOF
+$rows
+EOF
+}
+
+# changed_files DIR OUTFILE - sorted unique files touched in worktree DIR:
+# committed since merge-base with BASE + uncommitted vs HEAD + untracked (not ignored).
+changed_files() {
+  local dir=$1 out=$2 mb
+  mb=$(git -C "$dir" merge-base "$BASE" HEAD 2>/dev/null) || mb=""
+  {
+    [ -n "$mb" ] && git -C "$dir" -c core.quotepath=off diff --name-only "$mb" HEAD
+    git -C "$dir" -c core.quotepath=off diff --name-only HEAD
+    git -C "$dir" -c core.quotepath=off ls-files --others --exclude-standard
+  } 2>/dev/null | LC_ALL=C sort -u > "$out"
+}
+
+cmd_status() {
+  init_repo
+  local line wpath="" branch="" first=1 n=0 i j tmp collisions=0 common
+  local paths=() branches=()
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "worktree "*) wpath=${line#worktree }; branch="(detached)" ;;
+      "branch "*)   branch=${line#branch refs/heads/} ;;
+      "")
+        if [ -n "$wpath" ]; then
+          if [ "$first" = 1 ]; then first=0; else
+            paths[n]=$wpath
+            branches[n]=$branch
+            n=$((n + 1))
+          fi
+        fi
+        wpath="" ;;
+    esac
+  done < <(git -C "$MAIN" worktree list --porcelain; echo)
+
+  if [ "$n" -lt 2 ]; then
+    info "mniej niż dwa worktree, brak par do porównania"
+  else
+    tmp=$(mktemp -d) || die "mktemp nie powiodło się"
+    # Path baked into the trap string at definition time, so a later $tmp change can't redirect rm.
+    # shellcheck disable=SC2064
+    trap "rm -rf $(printf '%q' "$tmp")" EXIT
+    for ((i = 0; i < n; i++)); do
+      changed_files "${paths[i]}" "$tmp/$i"
+    done
+    for ((i = 0; i < n; i++)); do
+      for ((j = i + 1; j < n; j++)); do
+        common=$(LC_ALL=C comm -12 "$tmp/$i" "$tmp/$j")
+        if [ -n "$common" ]; then
+          collisions=$((collisions + 1))
+          info "KOLIZJA ${branches[i]} ↔ ${branches[j]}:"
+          printf '%s\n' "$common" | sed 's/^/  /'
+        fi
+      done
+    done
+    [ "$collisions" -eq 0 ] && info "brak wspólnych plików"
+  fi
+  info ""
+  cmd_list
+}
+# detect_test_cmd DIR - print the test command for the project in DIR, or return 1.
+# Order: WT_TEST (trusted config) > DIR/.wt-test > file-based autodetection.
+detect_test_cmd() {
+  local dir=$1 line
+  if [ -n "$CFG_WT_TEST" ]; then
+    printf '%s' "$CFG_WT_TEST"
+    return 0
+  fi
+  if [ -f "$dir/.wt-test" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      case "$line" in ''|'#'*) continue ;; esac
+      printf '%s' "$line"
+      return 0
+    done < "$dir/.wt-test"
+  fi
+  # pnpm lockfile is checked before package.json, otherwise pnpm projects would get npm.
+  if [ -f "$dir/pnpm-lock.yaml" ] && [ -f "$dir/package.json" ] && grep -q '"test"[[:space:]]*:' "$dir/package.json"; then
+    printf 'pnpm test'
+  elif [ -f "$dir/package.json" ] && grep -q '"test"[[:space:]]*:' "$dir/package.json"; then
+    printf 'npm test'
+  elif [ -f "$dir/pyproject.toml" ]; then
+    printf 'uv run pytest'
+  elif [ -f "$dir/Cargo.toml" ]; then
+    printf 'cargo test'
+  elif [ -f "$dir/go.mod" ]; then
+    printf 'go test ./...'
+  elif [ -f "$dir/Makefile" ] && grep -Eq '^test[[:space:]]*:' "$dir/Makefile"; then
+    printf 'make test'
+  else
+    return 1
+  fi
+}
+
+# run_tests DIR [ARGS...] - run the test command in DIR; returns its exit code.
+run_tests() {
+  local dir=$1 cmd rc
+  shift
+  cmd=$(detect_test_cmd "$dir") || {
+    printf 'wt: nie wykryto komendy testowej w %s\n' "$dir" >&2
+    printf 'wt: utwórz plik %s/.wt-test z jedną linią, np. "npm test", albo ustaw WT_TEST w .git/wt.conf\n' "$dir" >&2
+    return 127
+  }
+  info "wt test: $cmd${*:+ $*}" >&2
+  (cd "$dir" && bash -c "$cmd \"\$@\"" wt-test "$@")
+  rc=$?
+  return "$rc"
+}
+
+cmd_test() {
+  local top
+  repo_main
+  load_config
+  top=$(git rev-parse --show-toplevel) || die "nie udało się ustalić korzenia repo"
+  run_tests "$top" "$@"
+}
+cmd_merge()  { not_implemented merge; }
+cmd_drop()   { not_implemented drop; }
+
+# ----------------------------------------------------------------- main -----
+
+case "${1:-}" in
+  new)         shift; cmd_new "$@" ;;
+  list|ls)     shift; cmd_list "$@" ;;
+  status)      shift; cmd_status "$@" ;;
+  test)        shift; cmd_test "$@" ;;
+  merge)       shift; cmd_merge "$@" ;;
+  drop)        shift; cmd_drop "$@" ;;
+  config)      shift; cmd_config "$@" ;;
+  *)           usage ;;
+esac
