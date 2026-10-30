@@ -16,7 +16,7 @@ Cel: fizyczna izolacja plików między równoległymi sesjami (każdy feature we
 | 4 | `wt status` (detektor kolizji) | gotowe |
 | 2b | `wt new`: synchronizacja bazy z upstreamem (`fetch` + `ff-only`), `--no-fetch`, `WT_FETCH` | gotowe |
 
-Weryfikacja: 126 testów w skrypcie testowym (0 błędów) na bash 5.3 i na `/bin/bash` 3.2, `bash -n` oraz `shellcheck` bez uwag.
+Weryfikacja: 129 testów w skrypcie testowym (0 błędów) na bash 5.3 i na `/bin/bash` 3.2, `bash -n` oraz `shellcheck` bez uwag.
 
 ### Do zrobienia
 

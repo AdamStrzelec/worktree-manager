@@ -7,8 +7,13 @@ set -uo pipefail
 
 # ---------------------------------------------------------------- output ----
 
+# Errors are red on a terminal; NO_COLOR disables, WT_COLOR=always forces (used by tests).
 die() {
-  printf 'wt: %s\n' "$*" >&2
+  if [ -z "${NO_COLOR:-}" ] && { [ -t 2 ] || [ "${WT_COLOR:-}" = always ]; }; then
+    printf '\033[31mwt: %s\033[0m\n' "$*" >&2
+  else
+    printf 'wt: %s\n' "$*" >&2
+  fi
   exit 1
 }
 

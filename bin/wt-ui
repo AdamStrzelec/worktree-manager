@@ -13,10 +13,21 @@ import textwrap
 WT = os.environ.get("WT_CMD", "wt")
 
 
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def clean_error(text, fallback):
+    """Strip colors and the 'wt: ' prefix from command stderr; fall back when empty."""
+    lines = [ANSI_RE.sub("", l).rstrip() for l in text.splitlines()]
+    lines = [re.sub(r"^wt: ", "", l) for l in lines if l.strip()]
+    return "\n".join(lines) or fallback
+
+
 def run(cmd, cwd=None, timeout=30):
     """Run a command, return (rc, stdout, stderr)."""
     try:
-        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        env = dict(os.environ, NO_COLOR="1")
+        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, "", str(e)
@@ -71,14 +82,16 @@ class App:
         self.top = 0
         self.filter = ""
         self.message = ""
+        self.pending_error = None
         self.detail_cache = {}
         self.reload()
 
     def reload(self):
         rc, out, err = run([WT, "list", "--porcelain"])
         if rc != 0:
-            self.message = "! " + (err.strip().splitlines() or ["wt list nie powiodło się"])[-1]
+            self.message = "! wt list nie powiodło się"
             self.rows = []
+            self.pending_error = ("Błąd", clean_error(err, "wt list nie powiodło się"))
             return
         self.rows = parse_list(out)
         _, sout, serr = run([WT, "status"])
@@ -98,6 +111,49 @@ class App:
         self.scr.addnstr(h - 1, 0, (question + " [y/n] ").ljust(w - 1), w - 1, curses.A_REVERSE)
         self.scr.refresh()
         return self.scr.getch() in (ord("y"), ord("Y"))
+
+    def modal(self, title, text):
+        """Red error box centered on screen; dismissed with Enter, Space or Esc."""
+        scr = self.scr
+        while True:
+            h, w = scr.getmaxyx()
+            box_w = max(20, min(w - 4, 76))
+            body = []
+            for line in text.splitlines() or [""]:
+                body += textwrap.wrap(line, box_w - 4, subsequent_indent="  ") or [""]
+            max_body = max(1, h - 8)
+            if len(body) > max_body:
+                body = body[:max_body - 1] + ["..."]
+            box_h = len(body) + 7
+            y0, x0 = max(0, (h - box_h) // 2), max(0, (w - box_w) // 2)
+            red = curses.color_pair(4)
+            # Red foreground on the default background: same palette slot as the red text wt
+            # prints in the shell, so it matches the terminal theme (white-on-red did not).
+            for y in range(box_h):
+                scr.addnstr(y0 + y, x0, " " * box_w, box_w)
+            scr.attron(red)
+            scr.hline(y0, x0 + 1, curses.ACS_HLINE, box_w - 2)
+            scr.hline(y0 + box_h - 1, x0 + 1, curses.ACS_HLINE, box_w - 2)
+            scr.vline(y0 + 1, x0, curses.ACS_VLINE, box_h - 2)
+            scr.vline(y0 + 1, x0 + box_w - 1, curses.ACS_VLINE, box_h - 2)
+            scr.addch(y0, x0, curses.ACS_ULCORNER)
+            scr.addch(y0, x0 + box_w - 1, curses.ACS_URCORNER)
+            scr.addch(y0 + box_h - 1, x0, curses.ACS_LLCORNER)
+            scr.addch(y0 + box_h - 1, x0 + box_w - 1, curses.ACS_LRCORNER)
+            scr.attroff(red)
+            scr.addnstr(y0 + 1, x0 + 1, (" " + title).ljust(box_w - 2), box_w - 2,
+                        red | curses.A_BOLD | curses.A_REVERSE)
+            for i, line in enumerate(body):
+                scr.addnstr(y0 + 3 + i, x0 + 2, line, box_w - 4, red)
+            label = "[ OK ]"
+            scr.addnstr(y0 + box_h - 2, x0 + (box_w - len(label)) // 2, label, len(label),
+                        red | curses.A_REVERSE | curses.A_BOLD)
+            scr.refresh()
+            key = scr.getch()
+            if key in (10, 13, 27, ord(" "), curses.KEY_ENTER):
+                return
+            if key == curses.KEY_RESIZE:
+                scr.erase()
 
     def prompt(self, label):
         h, w = self.scr.getmaxyx()
@@ -211,7 +267,8 @@ class App:
                     self.cursor = i
             self.message = f"+ {name}"
         else:
-            self.message = "! " + (err.strip().splitlines() or ["wt new nie powiodło się"])[-1]
+            self.message = f"! wt new {name} nie powiodło się"
+            self.modal(f"wt new {name}: błąd", clean_error(err, "wt new nie powiodło się"))
 
     def run_tests(self, row):
         """Suspend curses, run `wt test` in the worktree, wait for a key."""
@@ -235,14 +292,21 @@ class App:
             p = subprocess.run(["pbcopy"], input=cmd, text=True, timeout=5)
             self.message = f"skopiowano: {cmd}" if p.returncode == 0 else "! pbcopy zwrócił błąd"
         except (OSError, subprocess.TimeoutExpired):
-            self.message = f"! brak pbcopy, wpisz ręcznie: {cmd}"
+            self.message = "! brak pbcopy"
+            self.modal("Schowek niedostępny", f"Brak pbcopy. Wpisz ręcznie:\n{cmd}")
 
     def loop(self):
         curses.curs_set(0)
         curses.use_default_colors()
         curses.init_pair(2, curses.COLOR_RED, -1)
         curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_RED, -1)
         while True:
+            if self.pending_error:
+                title, text = self.pending_error
+                self.pending_error = None
+                self.draw()
+                self.modal(title, text)
             self.draw()
             key = self.scr.getch()
             rows = self.visible()

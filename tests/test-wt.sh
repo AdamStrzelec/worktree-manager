@@ -125,6 +125,14 @@ printf '{"session":"","pid":%s,"pane":"%%9","time":"x","user":"u"}\n' "$$" > .cl
 line=$($WT list 2>&1 | grep '^feat-a ')
 contains "właściciel zajęty" "$line" "zajęty (pid $$, %9)"
 
+echo "-- błędy na czerwono"
+out=$(WT_COLOR=always $WT new "a b" 2>&1)
+case "$out" in *$'\033[31mwt: '*$'\033[0m'*) ok "die: czerwony przy WT_COLOR=always" ;; *) bad "die: brak koloru: $out" ;; esac
+out=$(WT_COLOR=always NO_COLOR=1 $WT new "a b" 2>&1)
+case "$out" in *$'\033'*) bad "NO_COLOR ignorowany" ;; *) ok "NO_COLOR wyłącza kolor" ;; esac
+out=$($WT new "a b" 2>&1)
+case "$out" in *$'\033'*) bad "kolor bez tty" ;; *) ok "bez tty brak kolorów" ;; esac
+
 echo "-- list --porcelain"
 out=$($WT list --porcelain 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "porcelain exit 0" || bad "porcelain exit $rc"
