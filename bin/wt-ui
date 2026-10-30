@@ -1,0 +1,291 @@
+#!/usr/bin/env python3
+"""Terminal UI for wt: browse worktrees, see details and collisions, create and test.
+
+Launched by `wt ui`. All git work goes through the `wt` script (WT_CMD) or read-only git calls.
+"""
+import curses
+import os
+import re
+import subprocess
+import sys
+import textwrap
+
+WT = os.environ.get("WT_CMD", "wt")
+
+
+def run(cmd, cwd=None, timeout=30):
+    """Run a command, return (rc, stdout, stderr)."""
+    try:
+        p = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except (OSError, subprocess.TimeoutExpired) as e:
+        return 1, "", str(e)
+
+
+def parse_list(text):
+    """Parse `wt list --porcelain` (path, branch, age, ahead, dirty, owner; tab-separated)."""
+    rows = []
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 6:
+            continue
+        path, branch, age, ahead, dirty, owner = parts
+        rows.append({"path": path, "branch": branch, "age": age,
+                     "ahead": ahead, "dirty": dirty, "owner": owner})
+    return rows
+
+
+def parse_collisions(text):
+    """Parse `wt status` stderr into {branch: [(other_branch, [files])]}."""
+    result = {}
+    current = None
+    for line in text.splitlines():
+        m = re.match(r"^KOLIZJA (.+) ↔ (.+):$", line)
+        if m:
+            a, b = m.group(1), m.group(2)
+            files = []
+            result.setdefault(a, []).append((b, files))
+            result.setdefault(b, []).append((a, files))
+            current = files
+        elif line.startswith("  ") and current is not None:
+            current.append(line.strip())
+        else:
+            current = None
+    return result
+
+
+def parse_base(text):
+    for line in text.splitlines():
+        if line.startswith("baza:"):
+            return line.split(":", 1)[1].strip()
+    return ""
+
+
+class App:
+    def __init__(self, scr):
+        self.scr = scr
+        self.rows = []
+        self.collisions = {}
+        self.base = ""
+        self.cursor = 0
+        self.top = 0
+        self.filter = ""
+        self.message = ""
+        self.detail_cache = {}
+        self.reload()
+
+    def reload(self):
+        rc, out, err = run([WT, "list", "--porcelain"])
+        if rc != 0:
+            self.message = "! " + (err.strip().splitlines() or ["wt list nie powiodło się"])[-1]
+            self.rows = []
+            return
+        self.rows = parse_list(out)
+        _, sout, serr = run([WT, "status"])
+        self.collisions = parse_collisions(serr + sout)
+        _, cout, cerr = run([WT, "config"])
+        self.base = parse_base(cout + cerr)
+        self.detail_cache = {}
+
+    def visible(self):
+        if not self.filter:
+            return self.rows
+        f = self.filter.lower()
+        return [r for r in self.rows if f in r["branch"].lower()]
+
+    def confirm(self, question):
+        h, w = self.scr.getmaxyx()
+        self.scr.addnstr(h - 1, 0, (question + " [y/n] ").ljust(w - 1), w - 1, curses.A_REVERSE)
+        self.scr.refresh()
+        return self.scr.getch() in (ord("y"), ord("Y"))
+
+    def prompt(self, label):
+        h, w = self.scr.getmaxyx()
+        curses.echo()
+        curses.curs_set(1)
+        self.scr.addnstr(h - 1, 0, label.ljust(w - 1), w - 1)
+        self.scr.move(h - 1, len(label))
+        value = self.scr.getstr(h - 1, len(label), 60).decode("utf-8", "replace")
+        curses.noecho()
+        curses.curs_set(0)
+        return value.strip()
+
+    def details(self, row):
+        key = row["path"]
+        if key in self.detail_cache:
+            return self.detail_cache[key]
+        lines = []
+        if self.base:
+            _, out, _ = run(["git", "-C", row["path"], "log", "--oneline", "-n", "8",
+                             f"{self.base}..HEAD"])
+            commits = out.strip().splitlines()
+        else:
+            commits = []
+        _, out, _ = run(["git", "-C", row["path"], "status", "--short"])
+        changed = out.strip().splitlines()
+        lines.append((f"commity ponad {self.base or 'bazą'}:", curses.A_BOLD))
+        lines += [("  " + c, 0) for c in commits] or [("  (brak)", curses.A_DIM)]
+        lines.append(("", 0))
+        lines.append(("niezacommitowane:", curses.A_BOLD))
+        lines += [("  " + c, 0) for c in changed[:15]] or [("  (czysto)", curses.A_DIM)]
+        if len(changed) > 15:
+            lines.append((f"  ... i {len(changed) - 15} więcej", curses.A_DIM))
+        self.detail_cache[key] = lines
+        return lines
+
+    def draw(self):
+        scr = self.scr
+        scr.erase()
+        h, w = scr.getmaxyx()
+        rows = self.visible()
+        self.cursor = max(0, min(self.cursor, len(rows) - 1))
+        body_h = h - 3
+        if self.cursor < self.top:
+            self.top = self.cursor
+        elif self.cursor >= self.top + body_h:
+            self.top = self.cursor - body_h + 1
+        left_w = max(34, w * 40 // 100)
+
+        header = " wt  |  worktree: %d" % len(rows)
+        if self.base:
+            header += f"  |  baza: {self.base}"
+        if self.filter:
+            header += f"  |  filtr: {self.filter}"
+        scr.addnstr(0, 0, header.ljust(w - 1), w - 1, curses.A_REVERSE | curses.A_BOLD)
+
+        if not rows:
+            scr.addnstr(2, 2, "brak worktree (n = nowy)", w - 3, curses.A_DIM)
+        for i, r in enumerate(rows[self.top:self.top + body_h]):
+            idx = self.top + i
+            attr = curses.A_REVERSE if idx == self.cursor else 0
+            coll = "!" if r["branch"] in self.collisions else " "
+            busy = "●" if r["owner"] != "wolny" else " "
+            dirty = f"~{r['dirty']}" if r["dirty"] != "0" else "  "
+            text = f" {busy}{coll} {r['branch']}  +{r['ahead']} {dirty}"
+            if r["branch"] in self.collisions:
+                attr |= curses.color_pair(2)
+            elif r["dirty"] != "0":
+                attr |= curses.color_pair(3)
+            scr.addnstr(1 + i, 0, text.ljust(left_w - 1), left_w - 1, attr)
+
+        for y in range(1, h - 2):
+            scr.addch(y, left_w, curses.ACS_VLINE)
+
+        right_x, right_w = left_w + 2, w - left_w - 3
+        if rows and right_w > 10:
+            r = rows[self.cursor]
+            lines = [(r["branch"], curses.A_BOLD), (r["path"], curses.A_DIM),
+                     (f"wiek: {r['age']}   ahead: {r['ahead']}   brudne: {r['dirty']}", 0),
+                     (f"właściciel: {r['owner']}", curses.color_pair(3) if r["owner"] != "wolny" else 0),
+                     ("", 0)]
+            for other, files in self.collisions.get(r["branch"], []):
+                lines.append((f"KOLIZJA z {other}:", curses.color_pair(2) | curses.A_BOLD))
+                lines += [("  " + f, curses.color_pair(2)) for f in files[:8]]
+                lines.append(("", 0))
+            lines += self.details(r)
+            y = 1
+            for text, attr in lines:
+                for chunk in textwrap.wrap(text, right_w, drop_whitespace=False,
+                                           subsequent_indent="    ") or [""]:
+                    if y >= h - 2:
+                        break
+                    scr.addnstr(y, right_x, chunk, right_w, attr)
+                    y += 1
+
+        scr.addnstr(h - 2, 0, (" " + self.message).ljust(w - 1), w - 1, curses.A_DIM)
+        keys = " j/k ↑↓ ruch  g/G góra/dół  n nowy  t testy  c kopiuj cd  r odśwież  / filtr  q wyjście"
+        scr.addnstr(h - 1, 0, keys.ljust(w - 1), w - 1, curses.A_REVERSE)
+        scr.refresh()
+
+    def new(self):
+        name = self.prompt("Nazwa nowego worktree: ")
+        if not name:
+            return
+        self.message = f"tworzę {name}..."
+        self.draw()
+        rc, out, err = run([WT, "new", name], timeout=120)
+        self.reload()
+        if rc == 0:
+            for i, r in enumerate(self.visible()):
+                if r["branch"] == name:
+                    self.cursor = i
+            self.message = f"+ {name}"
+        else:
+            self.message = "! " + (err.strip().splitlines() or ["wt new nie powiodło się"])[-1]
+
+    def run_tests(self, row):
+        """Suspend curses, run `wt test` in the worktree, wait for a key."""
+        curses.def_prog_mode()
+        curses.endwin()
+        print(f"\n== wt test w {row['path']} ==\n", flush=True)
+        try:
+            rc = subprocess.call([WT, "test"], cwd=row["path"])
+        except OSError as e:
+            print(e)
+            rc = 1
+        input(f"\n[koniec, kod {rc}] Enter wraca do UI ")
+        curses.reset_prog_mode()
+        self.scr.refresh()
+        self.reload()
+        self.message = "testy: OK" if rc == 0 else f"testy: kod wyjścia {rc}"
+
+    def copy_cd(self, row):
+        cmd = f"cd {row['path']}"
+        try:
+            p = subprocess.run(["pbcopy"], input=cmd, text=True, timeout=5)
+            self.message = f"skopiowano: {cmd}" if p.returncode == 0 else "! pbcopy zwrócił błąd"
+        except (OSError, subprocess.TimeoutExpired):
+            self.message = f"! brak pbcopy, wpisz ręcznie: {cmd}"
+
+    def loop(self):
+        curses.curs_set(0)
+        curses.use_default_colors()
+        curses.init_pair(2, curses.COLOR_RED, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        while True:
+            self.draw()
+            key = self.scr.getch()
+            rows = self.visible()
+            row = rows[self.cursor] if rows else None
+            page = max(1, self.scr.getmaxyx()[0] - 3)
+            if key in (ord("q"), 27):
+                if self.filter and key == 27:
+                    self.filter = ""
+                    continue
+                break
+            elif key in (curses.KEY_UP, ord("k")):
+                self.cursor -= 1
+            elif key in (curses.KEY_DOWN, ord("j")):
+                self.cursor += 1
+            elif key == curses.KEY_PPAGE:
+                self.cursor -= page
+            elif key == curses.KEY_NPAGE:
+                self.cursor += page
+            elif key in (curses.KEY_HOME, ord("g")):
+                self.cursor = 0
+            elif key in (curses.KEY_END, ord("G")):
+                self.cursor = len(rows) - 1
+            elif key == ord("r"):
+                self.reload()
+                self.message = "odświeżono"
+            elif key == ord("/"):
+                self.filter = self.prompt("Filtr (pusty = wyczyść): ")
+                self.cursor = 0
+            elif key == ord("n"):
+                self.new()
+            elif key == ord("t") and row:
+                self.run_tests(row)
+            elif key == ord("c") and row:
+                self.copy_cd(row)
+
+
+def main():
+    rc, _, err = run([WT, "list", "--porcelain"])
+    if rc != 0:
+        sys.exit(err.strip() or "wt: nie udało się odczytać listy worktree")
+    os.environ.setdefault("ESCDELAY", "25")
+    curses.wrapper(lambda scr: App(scr).loop())
+
+
+if __name__ == "__main__":
+    main()

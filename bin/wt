@@ -231,6 +231,7 @@ usage() {
     printf '  test [args]             testy w bieżącym worktree\n'
     printf '  merge <temat>           testy, rebase, testy, merge --ff-only\n'
     printf '  drop <temat> [--yes]    usuń worktree (bez --yes tylko podgląd)\n'
+    printf '  ui                      interfejs w terminalu (curses)\n'
     printf '  config                  efektywna konfiguracja i jej źródła\n\n'
     printf 'Repo: %s\n' "${repo:-(poza repo git)}"
   } >&2
@@ -408,6 +409,12 @@ cmd_new() {
 }
 
 cmd_list() {
+  local porcelain=0
+  case "${1:-}" in
+    --porcelain) porcelain=1 ;;
+    "") ;;
+    *) die "nieznana opcja: $1 (użycie: wt list [--porcelain])" ;;
+  esac
   init_repo
   local line wpath="" branch="" first=1 rows="" width=6
   # Collect "path<TAB>branch" for every worktree except the main checkout.
@@ -428,11 +435,11 @@ cmd_list() {
   done < <(git -C "$MAIN" worktree list --porcelain; echo)
 
   if [ -z "$rows" ]; then
-    info "brak worktree"
+    [ "$porcelain" = 1 ] || info "brak worktree"
     return 0
   fi
 
-  printf "%-${width}s  %-16s  %-5s  %-6s  %s\n" GALAZ WIEK AHEAD BRUDNE WLASCICIEL
+  [ "$porcelain" = 1 ] || printf "%-${width}s  %-16s  %-5s  %-6s  %s\n" GALAZ WIEK AHEAD BRUDNE WLASCICIEL
   local p b age ahead dirty owner pid pane
   while IFS='	' read -r p b; do
     [ -n "$p" ] || continue
@@ -447,7 +454,12 @@ cmd_list() {
         owner="zajęty (pid $pid${pane:+, $pane})"
       fi
     fi
-    printf "%-${width}s  %-16s  %-5s  %-6s  %s\n" "$b" "$age" "$ahead" "$dirty" "$owner"
+    if [ "$porcelain" = 1 ]; then
+      # Machine-readable: path, branch, age, ahead, dirty, owner (tab-separated).
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$p" "$b" "$age" "$ahead" "$dirty" "$owner"
+    else
+      printf "%-${width}s  %-16s  %-5s  %-6s  %s\n" "$b" "$age" "$ahead" "$dirty" "$owner"
+    fi
   done <<EOF
 $rows
 EOF
@@ -566,6 +578,21 @@ cmd_test() {
   top=$(git rev-parse --show-toplevel) || die "nie udało się ustalić korzenia repo"
   run_tests "$top" "$@"
 }
+# cmd_ui - launch the curses UI (bin/wt-ui next to this script, symlinks resolved).
+cmd_ui() {
+  local src=$0 dir link
+  while [ -L "$src" ]; do
+    link=$(readlink "$src")
+    case "$link" in
+      /*) src=$link ;;
+      *)  src="$(dirname "$src")/$link" ;;
+    esac
+  done
+  dir=$(cd "$(dirname "$src")" && pwd -P)
+  [ -f "$dir/wt-ui" ] || die "brak pliku $dir/wt-ui"
+  command -v python3 >/dev/null 2>&1 || die "wt ui wymaga python3"
+  WT_CMD="$src" exec python3 "$dir/wt-ui" "$@"
+}
 cmd_merge()  { not_implemented merge; }
 cmd_drop()   { not_implemented drop; }
 
@@ -579,5 +606,6 @@ case "${1:-}" in
   merge)       shift; cmd_merge "$@" ;;
   drop)        shift; cmd_drop "$@" ;;
   config)      shift; cmd_config "$@" ;;
+  ui)          shift; cmd_ui "$@" ;;
   *)           usage ;;
 esac

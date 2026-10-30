@@ -125,6 +125,45 @@ printf '{"session":"","pid":%s,"pane":"%%9","time":"x","user":"u"}\n' "$$" > .cl
 line=$($WT list 2>&1 | grep '^feat-a ')
 contains "właściciel zajęty" "$line" "zajęty (pid $$, %9)"
 
+echo "-- list --porcelain"
+out=$($WT list --porcelain 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "porcelain exit 0" || bad "porcelain exit $rc"
+line=$(printf '%s\n' "$out" | grep "	feat-a	")
+contains "porcelain ścieżka" "$line" "$R/.claude/worktrees/feat-a	feat-a"
+n=$(printf '%s' "$line" | awk -F'\t' '{print NF}')
+[ "$n" -eq 6 ] && ok "porcelain 6 pól" || bad "porcelain pól: $n"
+case "$out" in *GALAZ*) bad "porcelain bez nagłówka" ;; *) ok "porcelain bez nagłówka" ;; esac
+check_fail "list: nieznana opcja" $WT list --nope
+
+echo "-- ui"
+UIBIN=$(dirname "$WT_BIN")/wt-ui
+check "wt-ui istnieje i jest wykonywalny" test -x "$UIBIN"
+check "wt-ui kompiluje się" python3 -m py_compile "$UIBIN"
+out=$(python3 - "$UIBIN" <<'PY' 2>&1
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("wt_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("wt_ui", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+rows = m.parse_list("/p/a\tfeat-a\t2 hours ago\t3\t1\tzajęty (pid 5, %1)\nśmieci\n")
+assert len(rows) == 1 and rows[0]["branch"] == "feat-a" and rows[0]["owner"].startswith("zajęty"), rows
+c = m.parse_collisions("KOLIZJA a ↔ b:\n  x.txt\n  y/z.txt\nbrak\n")
+assert c["a"][0][0] == "b" and c["b"][0][0] == "a" and c["a"][0][1] == ["x.txt", "y/z.txt"], c
+assert m.parse_base("repo:  /r\nbaza:  main\n") == "main"
+print("PARSERY-OK")
+PY
+)
+contains "parsery wt-ui" "$out" "PARSERY-OK"
+LD=$(mktemp -d)
+ln -s "$WT_BIN" "$LD/wt"
+out=$(cd "$R" && "$SH" "$LD/wt" ui </dev/null 2>&1); rc=$?
+case "$out" in *"brak pliku"*) bad "ui przez symlink nie znalazł wt-ui: $out" ;; *) ok "ui przez symlink znajduje wt-ui" ;; esac
+rm -rf "$LD"
+CP=$(mktemp -d); cp "$WT_BIN" "$CP/wt"
+out=$(cd "$R" && "$SH" "$CP/wt" ui 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "ui bez wt-ui obok: błąd" || bad "ui bez wt-ui obok: rc=$rc"
+contains "ui bez wt-ui komunikat" "$out" "brak pliku"
+rm -rf "$CP"
+
 echo "-- z wnętrza worktree"
 out=$(cd .claude/worktrees/feat-a && $WT list 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "list z worktree" || bad "list z worktree exit $rc"

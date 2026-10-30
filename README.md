@@ -9,6 +9,7 @@ Pełny opis działania, konfiguracji i planów jest w [docs/wt-manager.md](docs/
 | Komenda | Stan |
 |---|---|
 | `wt new`, `wt list`, `wt status`, `wt test`, `wt config` | gotowe i przetestowane |
+| `wt ui` | gotowe: interfejs w terminalu (wymaga `python3`), testowane tylko ręcznie i pty-smoke |
 | `wt merge`, `wt drop` | jeszcze niezaimplementowane (komenda zwraca błąd "jeszcze niezaimplementowana") |
 
 Do czasu wdrożenia `merge` i `drop` zmergowanie i sprzątanie robi się ręcznie gitem (patrz "Sprzątanie" niżej).
@@ -22,7 +23,7 @@ Do czasu wdrożenia `merge` i `drop` zmergowanie i sprzątanie robi się ręczni
 
 ## Instalacja
 
-Skrypt jest jednym plikiem (`bin/wt`). Zalecana instalacja to symlink, bo `git pull` aktualizuje wtedy zainstalowaną wersję automatycznie.
+Skrypt to `bin/wt` plus `bin/wt-ui` (interfejs `wt ui`, Python 3, bez zależności). `wt ui` szuka `wt-ui` obok prawdziwego pliku `wt`, więc przy kopiowaniu skopiuj oba pliki. Zalecana instalacja to symlink, bo `git pull` aktualizuje wtedy zainstalowaną wersję automatycznie.
 
 ```bash
 git clone <URL-repo> ~/repozytoria/worktree-manager
@@ -91,6 +92,8 @@ wt status
 - `wt test` uruchamia testy w bieżącym worktree (komenda z konfiguracji, z pliku `.wt-test` albo wykryta automatycznie).
 - `wt list` pokazuje worktree: wiek ostatniego commita, liczbę commitów ponad bazą, liczbę brudnych plików i właściciela.
 - `wt status` wykrywa kolizje: pliki zmieniane jednocześnie w więcej niż jednym worktree.
+- `wt ui` otwiera interfejs: lista worktree po lewej, szczegóły i kolizje po prawej. Klawisze: `j`/`k` lub strzałki, `g`/`G`, `n` nowy worktree, `t` testy, `c` kopiuje `cd <ścieżka>` do schowka (`pbcopy`), `r` odśwież, `/` filtr, `q` wyjście.
+- `wt list --porcelain` daje wyjście dla skryptów: ścieżka, gałąź, wiek, ahead, brudne, właściciel, rozdzielone tabulatorem.
 
 Komendy działają z dowolnego miejsca repo, także z wnętrza worktree.
 
