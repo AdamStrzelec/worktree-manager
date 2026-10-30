@@ -143,6 +143,18 @@ n=$(printf '%s' "$line" | awk -F'\t' '{print NF}')
 case "$out" in *GALAZ*) bad "porcelain bez nagłówka" ;; *) ok "porcelain bez nagłówka" ;; esac
 check_fail "list: nieznana opcja" $WT list --nope
 
+echo "-- new: --target / --title"
+git branch dev-x
+out=$($WT new feat-t --target dev-x --title "Mój tytuł" --no-fetch 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "new --target/--title exit 0" || bad "new --target exit $rc: $out"
+contains "new od gałęzi docelowej" "$out" "od dev-x"
+[ "$(git config branch.feat-t.wt-target)" = dev-x ] && ok "target zapisany w git config" || bad "target w config"
+[ "$(git config branch.feat-t.wt-title)" = "Mój tytuł" ] && ok "tytuł zapisany w git config" || bad "tytuł w config"
+check_fail "new --target nieistniejąca gałąź" $WT new feat-u --target brak-takiej --no-fetch
+check_fail "new --target bez wartości" $WT new feat-u --target
+git worktree remove --force .claude/worktrees/feat-t && git branch -q -D feat-t
+[ -z "$(git config --get branch.feat-t.wt-target)" ] && ok "config znika z gałęzią" || bad "config został po usunięciu gałęzi"
+
 echo "-- ui"
 UIBIN=$(dirname "$WT_BIN")/wt-ui
 check "wt-ui istnieje i jest wykonywalny" test -x "$UIBIN"

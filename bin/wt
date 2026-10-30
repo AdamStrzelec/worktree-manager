@@ -351,18 +351,28 @@ sync_base() {
 }
 
 cmd_new() {
-  local name="" path f post_rc=0 rel hash do_fetch=1 arg
-  for arg in "$@"; do
-    case "$arg" in
+  local name="" path f post_rc=0 rel hash do_fetch=1 target="" title=""
+  local usage="użycie: wt new <temat> [--target <gałąź>] [--title <tytuł>] [--no-fetch]"
+  while [ $# -gt 0 ]; do
+    case "$1" in
       --no-fetch) do_fetch=0 ;;
-      -*)         die "nieznana opcja: $arg" ;;
+      --target)   [ $# -ge 2 ] || die "$usage"; target=$2; shift ;;
+      --title)    [ $# -ge 2 ] || die "$usage"; title=$2; shift ;;
+      -*)         die "nieznana opcja: $1" ;;
       *)
-        [ -n "$name" ] && die "użycie: wt new <temat> [--no-fetch]"
-        name=$arg ;;
+        [ -n "$name" ] && die "$usage"
+        name=$1 ;;
     esac
+    shift
   done
-  [ -n "$name" ] || die "użycie: wt new <temat> [--no-fetch]"
+  [ -n "$name" ] || die "$usage"
   init_repo
+  if [ -n "$target" ]; then
+    git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$target" >/dev/null \
+      || die "gałąź docelowa '$target' nie istnieje"
+    BASE=$target
+  fi
+  title=$(printf '%s' "$title" | tr '\t\n\r' '   ')
   valid_name "$name"
   path="$WT_ROOT/$name"
   [ -e "$path" ] && die "ścieżka już istnieje: $path"
@@ -378,6 +388,9 @@ cmd_new() {
   fi
 
   git -C "$MAIN" worktree add -q -b "$name" "$path" "$BASE" || die "git worktree add nie powiodło się"
+  # Per-branch metadata (git removes it together with the branch).
+  git -C "$MAIN" config "branch.$name.wt-target" "$BASE"
+  if [ -n "$title" ]; then git -C "$MAIN" config "branch.$name.wt-title" "$title"; fi
 
   for f in $CFG_WT_LINK; do
     if [ -e "$MAIN/$f" ] || [ -L "$MAIN/$f" ]; then
