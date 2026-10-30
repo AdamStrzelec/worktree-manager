@@ -66,7 +66,9 @@ Baza musi być czysta w plikach trackowanych (nietrackowane pliki nie przeszkadz
 wt new moj-feature
 ```
 
-Komenda tworzy gałąź `moj-feature` od gałęzi bazowej (`main`, a jak jej nie ma, `master`) i worktree w `<repo>/.claude/worktrees/moj-feature`. Na końcu wypisuje linię `cd <ścieżka>`. Wejdź tam i pracuj normalnie gitem:
+Komenda tworzy gałąź `moj-feature` od gałęzi bazowej (`main`, a jak jej nie ma, `master`) i worktree w `<repo>/.claude/worktrees/moj-feature`. Na końcu wypisuje linię `cd <ścieżka>`.
+
+Zanim worktree powstanie, `wt new` pobiera zmiany ze zdalnego repo (`git fetch`) i, jeśli lokalna baza jest tylko w tyle, przewija ją do przodu (`--ff-only`). Brak upstreamu, brak sieci albo rozjazd historii nie przerywają działania: worktree powstaje wtedy z lokalnej bazy, z ostrzeżeniem. Pomija się to flagą `wt new moj-feature --no-fetch` albo `WT_FETCH=0` w configu. Szczegóły w [docs/wt-manager.md](docs/wt-manager.md). Wejdź tam i pracuj normalnie gitem:
 
 ```bash
 cd <ścieżka z ostatniej linii>
@@ -107,6 +109,7 @@ WT_POST_NEW=npm install
 | `WT_DIR` | `.claude/worktrees` | gdzie tworzyć worktree (względem głównego checkoutu albo absolutnie) |
 | `WT_BASE` | autodetekcja | gałąź bazowa |
 | `WT_LINK` | `.env .venv` | pliki symlinkowane z głównego checkoutu do nowego worktree |
+| `WT_FETCH` | `1` | `0` wyłącza pobieranie zmian z upstreamu przed `wt new` |
 | `WT_TEST` | brak (autodetekcja) | komenda testowa |
 | `WT_POST_NEW` | brak | komenda uruchamiana po `wt new` w nowym worktree |
 
@@ -175,4 +178,5 @@ shellcheck -s bash bin/wt
 - Repo bare i repo bez żadnego commita nie są obsługiwane.
 - `wt status` nie obsługuje nazw plików zawierających znak nowej linii.
 - `wt new` odmawia przy niezacommitowanych zmianach w plikach trackowanych bazy.
+- Synchronizacja bazy korzysta z `perl` (limit czasu `git fetch`). Bez `perl` fetch działa bez limitu czasu.
 - Pole `pid` w `.wt-owner` to proces nadrzędny wywołujący `wt` (powłoka lub sesja), a nie sam `wt`, który kończy się od razu.

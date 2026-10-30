@@ -14,8 +14,9 @@ Cel: fizyczna izolacja plików między równoległymi sesjami (każdy feature we
 | 2 | `wt new`, `wt list` (`ls`), normalizacja ścieżek | gotowe |
 | 3 | `wt test` (`.wt-test`, `WT_TEST`, autodetekcja) | gotowe |
 | 4 | `wt status` (detektor kolizji) | gotowe |
+| 2b | `wt new`: synchronizacja bazy z upstreamem (`fetch` + `ff-only`), `--no-fetch`, `WT_FETCH` | gotowe |
 
-Weryfikacja: 81 testów w skrypcie testowym (0 błędów) na bash 5.3 i na `/bin/bash` 3.2, `bash -n` oraz `shellcheck` bez uwag.
+Weryfikacja: 115 testów w skrypcie testowym (0 błędów) na bash 5.3 i na `/bin/bash` 3.2, `bash -n` oraz `shellcheck` bez uwag.
 
 ### Do zrobienia
 
@@ -68,7 +69,7 @@ Tylko to, co wynika z komend. Nigdy `git add -A`, `reset --hard`, `push` ani for
 
 | Komenda | Co robi pod spodem |
 |---|---|
-| `wt new <temat>` | Waliduje nazwę (regex `^[A-Za-z0-9][A-Za-z0-9._/-]*$`, bez `..`, `//`, końcowego `/` i `.lock`, plus `git check-ref-format`). Odmawia, gdy ścieżka lub gałąź istnieje albo baza ma zmiany w plikach trackowanych (pokazuje `git status --short`). Wykonuje `git worktree add -b <temat> <WT_ROOT>/<temat> <baza>`. Linkuje symlinkami istniejące pliki z `WT_LINK`. Zapisuje `.wt-owner`. Dopisuje do `info/exclude`. Uruchamia `WT_POST_NEW`. Wypisuje gałąź, krótki hash bazy i `cd <ścieżka>` |
+| `wt new <temat> [--no-fetch]` | Waliduje nazwę (regex `^[A-Za-z0-9][A-Za-z0-9._/-]*$`, bez `..`, `//`, końcowego `/` i `.lock`, plus `git check-ref-format`). Odmawia, gdy ścieżka lub gałąź istnieje albo baza ma zmiany w plikach trackowanych (pokazuje `git status --short`). Przed utworzeniem synchronizuje bazę z upstreamem (niżej). Wykonuje `git worktree add -b <temat> <WT_ROOT>/<temat> <baza>`. Linkuje symlinkami istniejące pliki z `WT_LINK`. Zapisuje `.wt-owner`. Dopisuje do `info/exclude`. Uruchamia `WT_POST_NEW`. Wypisuje gałąź, krótki hash bazy i `cd <ścieżka>` |
 | `wt list` / `wt ls` | Czyta `git worktree list --porcelain`, pomija główny checkout. Kolumny: GALAZ, WIEK (`git log -1 --format=%cr`), AHEAD (`rev-list --count baza..gałąź`), BRUDNE (liczba linii `status --porcelain`), WLASCICIEL ("zajęty (pid N, panel)" jeśli `kill -0` na pid z `.wt-owner` się powiedzie, w przeciwnym razie "wolny") |
 | `wt status` | Dla każdej pary worktree liczy wspólne zmienione pliki. Zmienione pliki to suma: `diff merge-base..HEAD`, `diff HEAD` i nietrackowane niezignorowane (`ls-files --others --exclude-standard`). Wypisuje `KOLIZJA a ↔ b:` z listą albo "brak wspólnych plików", na końcu `list`. Pliki tymczasowe w `mktemp -d`, sprzątane trapem EXIT |
 | `wt test [args]` | Wybiera komendę testową: `WT_TEST` (zaufane źródła), potem pierwsza linia `.wt-test` w korzeniu worktree, potem autodetekcja. Uruchamia ją w korzeniu bieżącego worktree (`git rev-parse --show-toplevel`) z przekazaniem argumentów. Zwraca kod wyjścia komendy. Brak komendy to kod 127 z instrukcją |
@@ -105,10 +106,30 @@ Format: `KLUCZ=wartość`, jedna para na linię, komentarze `#`, opcjonalne cudz
 | `WT_DIR` | `.claude/worktrees` | katalog na worktree. Względny liczy się od głównego checkoutu, może wychodzić poza repo (`../x`) lub być absolutny |
 | `WT_BASE` | puste (autodetekcja: `main`, `master`, bieżąca gałąź) | gałąź bazowa |
 | `WT_LINK` | `.env .venv` | lista plików symlinkowanych z głównego checkoutu, tylko istniejące |
+| `WT_FETCH` | `1` | `0` wyłącza synchronizację bazy z upstreamem w `wt new` (bezpieczny klucz, dozwolony też w `.wt.conf`) |
 | `WT_TEST` | puste | komenda testowa (zaufane źródła) |
 | `WT_POST_NEW` | puste | komenda po `wt new`, uruchamiana w nowym worktree (zaufane źródła). Przy błędzie worktree zostaje, a `wt new` zwraca ten sam kod wyjścia |
 
-Zmienne środowiska czytane przez skrypt: `CLAUDE_SESSION_ID`, `TMUX_PANE`, `USER`, `XDG_CONFIG_HOME`.
+Zmienne środowiska czytane przez skrypt: `CLAUDE_SESSION_ID`, `TMUX_PANE`, `USER`, `XDG_CONFIG_HOME`, `WT_FETCH_TIMEOUT` (sekundy, domyślnie 20, limit czasu `git fetch`).
+
+### Synchronizacja bazy w `wt new`
+
+Baza to **lokalna** gałąź (`main`, `master` albo `WT_BASE`). Po sprawdzeniu, że baza jest czysta w plikach trackowanych, `wt new` robi (chyba że `--no-fetch` albo `WT_FETCH=0`):
+
+1. Czyta upstream bazy z `branch.<baza>.remote` i `branch.<baza>.merge`. Brak upstreamu to informacja "brak upstreamu" i start z lokalnej bazy.
+2. `git fetch <remote> <gałąź>` z limitem czasu (`FETCH_TIMEOUT`), bez pytań o hasło (`GIT_TERMINAL_PROMPT=0`). Polecenie działa we własnej grupie procesów, która po przekroczeniu limitu jest zabijana w całości (także zawieszony `ssh`).
+3. Jeśli lokalna baza jest tylko **za** upstreamem, przewija ją do przodu: `git merge --ff-only` gdy baza jest wyciągnięta w głównym checkoucie, w przeciwnym razie `git fetch . <upstream>:refs/heads/<baza>` (przesuwa sam wskaźnik, bez ruszania plików).
+
+| Sytuacja | Zachowanie |
+|---|---|
+| brak upstreamu | informacja, start z lokalnej bazy |
+| fetch się nie udał (sieć, dostęp, limit czasu) | ostrzeżenie, start z lokalnej bazy, kod wyjścia 0 |
+| baza zgodna z upstreamem | bez komunikatu |
+| baza za upstreamem | przewinięcie i komunikat "zaktualizowana o N commit(ów)" |
+| baza przed upstreamem | informacja o niewypchniętych commitach, start z lokalnej bazy |
+| baza i upstream rozjechane | ostrzeżenie, nic nie zmieniam, start z lokalnej bazy |
+
+`wt` nigdy nie robi `pull`, `push` ani merge innego niż `--ff-only`.
 
 Przykładowy `.git/wt.conf` dla FitDoctor (do ustawienia):
 
@@ -181,6 +202,7 @@ wt drop auth-refactor --yes                 # usunięcie worktree i gałęzi (ga
 
 ### Zasady, o których warto pamiętać
 
+- `wt new` próbuje najpierw zaktualizować lokalną bazę z upstreamu (patrz "Synchronizacja bazy"), ale nigdy nie blokuje się na błędach sieci.
 - Nowy worktree powstaje od bazy, a baza nie może mieć niezacommitowanych zmian w plikach trackowanych. Nietrackowane pliki nie blokują.
 - `wt merge` (po implementacji) nigdy nie zmieni bazy, jeśli testy są czerwone albo rebase ma konflikt.
 - Wszystkie komendy działają z dowolnego miejsca repo, także z wnętrza worktree.

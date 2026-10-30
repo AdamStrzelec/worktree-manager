@@ -20,19 +20,24 @@ info() {
 
 # Keys a repo-tracked .wt.conf may set. Everything else needs a trusted source
 # (.git/wt.conf, global config, env) because WT_TEST / WT_POST_NEW run commands.
-SAFE_KEYS=" WT_DIR WT_BASE WT_LINK "
-ALL_KEYS="WT_DIR WT_BASE WT_LINK WT_TEST WT_POST_NEW"
+SAFE_KEYS=" WT_DIR WT_BASE WT_LINK WT_FETCH "
+ALL_KEYS="WT_DIR WT_BASE WT_LINK WT_FETCH WT_TEST WT_POST_NEW"
+
+# Seconds before a hung `git fetch` (network, auth prompt) is abandoned; env override for tests.
+FETCH_TIMEOUT=${WT_FETCH_TIMEOUT:-20}
+case "$FETCH_TIMEOUT" in ''|*[!0-9]*) FETCH_TIMEOUT=20 ;; esac
 
 # Built-in defaults.
 DEFAULT_WT_DIR=".claude/worktrees"
 DEFAULT_WT_BASE=""
 DEFAULT_WT_LINK=".env .venv"
+DEFAULT_WT_FETCH="1"
 DEFAULT_WT_TEST=""
 DEFAULT_WT_POST_NEW=""
 
 # Effective values and their origin, filled by load_config.
-CFG_WT_DIR="" CFG_WT_BASE="" CFG_WT_LINK="" CFG_WT_TEST="" CFG_WT_POST_NEW=""
-SRC_WT_DIR="" SRC_WT_BASE="" SRC_WT_LINK="" SRC_WT_TEST="" SRC_WT_POST_NEW=""
+CFG_WT_DIR="" CFG_WT_BASE="" CFG_WT_LINK="" CFG_WT_FETCH="" CFG_WT_TEST="" CFG_WT_POST_NEW=""
+SRC_WT_DIR="" SRC_WT_BASE="" SRC_WT_LINK="" SRC_WT_FETCH="" SRC_WT_TEST="" SRC_WT_POST_NEW=""
 
 # set_cfg KEY VALUE SOURCE - assign without eval (value stays plain text).
 set_cfg() {
@@ -40,6 +45,7 @@ set_cfg() {
     WT_DIR)      CFG_WT_DIR=$2;      SRC_WT_DIR=$3 ;;
     WT_BASE)     CFG_WT_BASE=$2;     SRC_WT_BASE=$3 ;;
     WT_LINK)     CFG_WT_LINK=$2;     SRC_WT_LINK=$3 ;;
+    WT_FETCH)    CFG_WT_FETCH=$2;    SRC_WT_FETCH=$3 ;;
     WT_TEST)     CFG_WT_TEST=$2;     SRC_WT_TEST=$3 ;;
     WT_POST_NEW) CFG_WT_POST_NEW=$2; SRC_WT_POST_NEW=$3 ;;
   esac
@@ -219,7 +225,7 @@ usage() {
   fi
   {
     printf 'Użycie: wt <komenda> [argumenty]\n\n'
-    printf '  new <temat>             nowy worktree i gałąź od bazy\n'
+    printf '  new <temat> [--no-fetch] nowy worktree i gałąź od (zaktualizowanej) bazy\n'
     printf '  list | ls               tabela worktree\n'
     printf '  status                  kolizje plików między worktree\n'
     printf '  test [args]             testy w bieżącym worktree\n'
@@ -258,9 +264,98 @@ not_implemented() {
   die "komenda '$1' jeszcze niezaimplementowana"
 }
 
+# run_limited SECONDS CMD... - run CMD with a time limit (macOS has no timeout(1)).
+# CMD runs in its own process group; on timeout the whole group is killed, so a hung ssh child
+# can neither outlive the limit nor prompt on the tty. Without perl the command runs unlimited.
+run_limited() {
+  local secs=$1
+  shift
+  if command -v perl >/dev/null 2>&1; then
+    PERL_BADLANG=0 perl -e '
+      my $s = shift @ARGV;
+      setpgrp(0, 0);
+      my $pid = fork();
+      if (!defined $pid) { exit 127 }
+      if (!$pid) { exec @ARGV or exit 127 }
+      $SIG{ALRM} = sub { kill "TERM", -$$; exit 124 };
+      alarm $s;
+      waitpid($pid, 0);
+      exit($? >> 8);
+    ' "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# sync_base - fetch BASE's upstream and fast-forward the local BASE when it is only behind.
+# Never fatal: every failure degrades to "use the local base" with a message.
+sync_base() {
+  local remote merge_ref rbranch up_ref up_sha local_sha cur n err errf
+  remote=$(git -C "$MAIN" config --get "branch.$BASE.remote" 2>/dev/null) || remote=""
+  merge_ref=$(git -C "$MAIN" config --get "branch.$BASE.merge" 2>/dev/null) || merge_ref=""
+  if [ -z "$remote" ] || [ "$remote" = "." ] || [ -z "$merge_ref" ]; then
+    info "brak upstreamu dla $BASE, używam lokalnej bazy"
+    return 0
+  fi
+  rbranch=${merge_ref#refs/heads/}
+
+  # stderr goes to a file, not a pipe: a straggling child holding a pipe would block $(...).
+  errf=$(mktemp) || errf=/dev/null
+  if ! run_limited "$FETCH_TIMEOUT" env GIT_TERMINAL_PROMPT=0 \
+      git -C "$MAIN" fetch --quiet "$remote" "$rbranch" >/dev/null 2>"$errf"; then
+    info "UWAGA: fetch z '$remote' nie powiódł się (brak sieci/dostępu albo limit ${FETCH_TIMEOUT}s), używam lokalnej bazy" >&2
+    [ -s "$errf" ] && printf '  %s\n' "$(head -1 "$errf")" >&2
+    [ "$errf" != /dev/null ] && rm -f "$errf"
+    return 0
+  fi
+  [ "$errf" != /dev/null ] && rm -f "$errf"
+
+  up_sha=$(git -C "$MAIN" rev-parse --verify --quiet "$BASE@{upstream}") || up_sha=""
+  up_ref=$(git -C "$MAIN" rev-parse --symbolic-full-name "$BASE@{upstream}" 2>/dev/null) || up_ref=""
+  if [ -z "$up_sha" ] || [ -z "$up_ref" ]; then
+    info "UWAGA: po fetch nie znaleziono $remote/$rbranch, używam lokalnej bazy" >&2
+    return 0
+  fi
+  local_sha=$(git -C "$MAIN" rev-parse "$BASE")
+  [ "$local_sha" = "$up_sha" ] && return 0
+
+  if git -C "$MAIN" merge-base --is-ancestor "$local_sha" "$up_sha"; then
+    n=$(git -C "$MAIN" rev-list --count "$local_sha..$up_sha")
+    cur=$(git -C "$MAIN" symbolic-ref --quiet --short HEAD 2>/dev/null) || cur=""
+    if [ "$cur" = "$BASE" ]; then
+      err=$(git -C "$MAIN" merge --ff-only --quiet "$up_sha" 2>&1)
+    else
+      # Not checked out in the main checkout: move the ref only (ff-only by default, no "+").
+      err=$(git -C "$MAIN" fetch --quiet . "$up_ref:refs/heads/$BASE" 2>&1)
+    fi
+    # shellcheck disable=SC2181
+    if [ $? -eq 0 ]; then
+      info "baza $BASE zaktualizowana o $n commit(ów) z $remote/$rbranch"
+    else
+      info "UWAGA: nie udało się przewinąć $BASE do $remote/$rbranch, używam lokalnej bazy" >&2
+      [ -n "$err" ] && printf '  %s\n' "$(printf '%s' "$err" | head -1)" >&2
+    fi
+  elif git -C "$MAIN" merge-base --is-ancestor "$up_sha" "$local_sha"; then
+    n=$(git -C "$MAIN" rev-list --count "$up_sha..$local_sha")
+    info "baza $BASE jest $n commit(ów) przed $remote/$rbranch (niewypchnięte), używam lokalnej"
+  else
+    info "UWAGA: $BASE i $remote/$rbranch rozjechały się, używam lokalnej bazy bez zmian" >&2
+  fi
+  return 0
+}
+
 cmd_new() {
-  [ $# -eq 1 ] || die "użycie: wt new <temat>"
-  local name=$1 path f post_rc=0 rel hash
+  local name="" path f post_rc=0 rel hash do_fetch=1 arg
+  for arg in "$@"; do
+    case "$arg" in
+      --no-fetch) do_fetch=0 ;;
+      -*)         die "nieznana opcja: $arg" ;;
+      *)
+        [ -n "$name" ] && die "użycie: wt new <temat> [--no-fetch]"
+        name=$arg ;;
+    esac
+  done
+  [ -n "$name" ] || die "użycie: wt new <temat> [--no-fetch]"
   init_repo
   valid_name "$name"
   path="$WT_ROOT/$name"
@@ -270,6 +365,10 @@ cmd_new() {
   if ! tracked_clean "$MAIN"; then
     git -C "$MAIN" status --short >&2
     die "baza ma niezacommitowane zmiany w plikach trackowanych"
+  fi
+
+  if [ "$do_fetch" = 1 ] && [ "$CFG_WT_FETCH" != 0 ]; then
+    sync_base
   fi
 
   git -C "$MAIN" worktree add -q -b "$name" "$path" "$BASE" || die "git worktree add nie powiodło się"

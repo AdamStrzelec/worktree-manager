@@ -222,6 +222,97 @@ case "$out" in *KOLIZJA*) bad "kolizja mimo rozłącznych plików" ;; *) ok "ża
 cd "$R" || exit 1
 rm -rf "$T4"
 
+echo "-- new: synchronizacja bazy z upstreamem"
+FC=""
+mkbare_remote() { # mkbare_remote REPO: bare remote as origin, main pushed with upstream
+  local b
+  b=$(mktemp -d); b=$(cd "$b" && pwd -P)
+  git init -q --bare -b main "$b"
+  git -C "$1" remote add origin "$b"
+  git -C "$1" push -q -u origin main 2>/dev/null
+  printf '%s' "$b"
+}
+remote_commit() { # remote_commit BARE FILE TEXT: push a commit from a throwaway clone, print its sha
+  local c
+  c=$(mktemp -d)
+  git clone -q "$1" "$c/c" 2>/dev/null
+  git -C "$c/c" config user.name t; git -C "$c/c" config user.email t@t
+  printf '%s\n' "$3" > "$c/c/$2"
+  git -C "$c/c" add "$2"; git -C "$c/c" commit -q -m "remote $2"
+  git -C "$c/c" push -q origin main 2>/dev/null
+  git -C "$c/c" rev-parse HEAD
+  rm -rf "$c"
+}
+fresh() { FR=$(mkrepo); FB=$(mkbare_remote "$FR"); FC="$FC $FR $FB"; cd "$FR" || exit 1; }
+
+fresh; out=$($WT new f-none 2>&1)
+contains "up-to-date: bez komunikatów o zmianie" "$out" "cd $FR"
+case "$out" in *zaktualizowana*|*UWAGA*) bad "up-to-date: niepotrzebny komunikat: $out" ;; *) ok "up-to-date: cisza" ;; esac
+
+fresh; sha=$(remote_commit "$FB" r1.txt one)
+out=$($WT new f-ahead 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "zdalny do przodu: exit 0" || bad "exit $rc: $out"
+contains "komunikat o aktualizacji" "$out" "zaktualizowana o 1 commit(ów)"
+[ "$(git rev-parse main)" = "$sha" ] && ok "lokalny main przewinięty" || bad "main nie przewinięty"
+[ "$(git -C .claude/worktrees/f-ahead rev-parse HEAD)" = "$sha" ] && ok "worktree od nowego commita" || bad "worktree od starego commita"
+check "plik zdalny w głównym checkoucie" test -f r1.txt
+check "plik zdalny w worktree" test -f .claude/worktrees/f-ahead/r1.txt
+
+fresh; git checkout -q -b other; sha=$(remote_commit "$FB" r2.txt two)
+out=$($WT new f-nocheck 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "main nie wyciągnięty: exit 0" || bad "exit $rc: $out"
+[ "$(git rev-parse main)" = "$sha" ] && ok "ref main przesunięty" || bad "ref main nie przesunięty: $out"
+[ "$(git symbolic-ref --short HEAD)" = other ] && ok "główny checkout został na other" || bad "checkout się zmienił"
+check_fail "pliki głównego checkoutu nietknięte" test -f r2.txt
+[ "$(git -C .claude/worktrees/f-nocheck rev-parse HEAD)" = "$sha" ] && ok "worktree od nowego commita (main nie wyciągnięty)" || bad "worktree od starego commita"
+
+fresh; echo l > l.txt; git add l.txt; git commit -q -m local; lsha=$(git rev-parse HEAD)
+out=$($WT new f-local 2>&1)
+contains "lokalne przed zdalnym" "$out" "1 commit(ów) przed origin/main"
+[ "$(git -C .claude/worktrees/f-local rev-parse HEAD)" = "$lsha" ] && ok "worktree z lokalnej bazy" || bad "worktree nie z lokalnej bazy"
+
+fresh; echo l > l.txt; git add l.txt; git commit -q -m local; before=$(git rev-parse main)
+remote_commit "$FB" r3.txt three >/dev/null
+out=$($WT new f-div 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "rozjazd: exit 0" || bad "rozjazd exit $rc"
+contains "rozjazd: ostrzeżenie" "$out" "rozjechały"
+[ "$(git rev-parse main)" = "$before" ] && ok "rozjazd: main bez zmian" || bad "rozjazd: main ruszony"
+check "rozjazd: worktree powstał" test -d .claude/worktrees/f-div
+
+fresh; git remote set-url origin /nonexistent/repo
+out=$($WT new f-off 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "niedostępny remote: exit 0" || bad "niedostępny remote exit $rc"
+contains "niedostępny remote: ostrzeżenie" "$out" "UWAGA: fetch"
+check "niedostępny remote: worktree powstał" test -d .claude/worktrees/f-off
+
+fresh; git remote set-url origin ssh://nohost/x; t0=$SECONDS
+out=$(GIT_SSH_COMMAND='sleep 30 #' WT_FETCH_TIMEOUT=2 $WT new f-hang 2>&1); rc=$?
+[ $((SECONDS - t0)) -lt 12 ] && ok "zawieszony fetch przerwany limitem czasu" || bad "fetch trwał $((SECONDS - t0))s"
+[ "$rc" -eq 0 ] && ok "zawieszony fetch: exit 0" || bad "exit $rc"
+contains "zawieszony fetch: ostrzeżenie" "$out" "UWAGA: fetch"
+check "zawieszony fetch: worktree powstał" test -d .claude/worktrees/f-hang
+
+fresh; before=$(git rev-parse main); remote_commit "$FB" r4.txt four >/dev/null
+$WT new --no-fetch f-nf1 >/dev/null 2>&1
+[ "$(git rev-parse main)" = "$before" ] && ok "--no-fetch przed nazwą" || bad "--no-fetch nie zadziałał (przed)"
+$WT new f-nf2 --no-fetch >/dev/null 2>&1
+[ "$(git rev-parse main)" = "$before" ] && ok "--no-fetch po nazwie" || bad "--no-fetch nie zadziałał (po)"
+printf 'WT_FETCH=0\n' > .git/wt.conf
+$WT new f-nf3 >/dev/null 2>&1
+[ "$(git rev-parse main)" = "$before" ] && ok "WT_FETCH=0 w .git/wt.conf" || bad "WT_FETCH=0 nie zadziałało"
+contains "wt config pokazuje WT_FETCH" "$($WT config 2>&1)" "WT_FETCH"
+rm .git/wt.conf
+$WT new f-nf4 >/dev/null 2>&1
+[ "$(git rev-parse main)" != "$before" ] && ok "po usunięciu configu fetch działa" || bad "fetch nie wrócił"
+
+check_fail "nieznana opcja" $WT new --bogus x
+check_fail "dwie nazwy" $WT new a b
+check_fail "sama flaga bez nazwy" $WT new --no-fetch
+
+cd "$R" || exit 1
+# shellcheck disable=SC2086
+rm -rf $FC
+
 echo "-- poza repo"
 out=$(cd / && $WT list 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "poza repo exit 1" || bad "poza repo exit $rc"
