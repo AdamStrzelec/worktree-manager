@@ -389,6 +389,24 @@ check_fail "nieznana opcja" $WT new --bogus x
 check_fail "dwie nazwy" $WT new a b
 check_fail "sama flaga bez nazwy" $WT new --no-fetch
 
+# wt config --porcelain: key<TAB>source<TAB>value<TAB>default, one row per key, order of ALL_KEYS
+out=$($WT config --porcelain 2>&1)
+[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 6 ] && ok "config --porcelain: 6 wierszy" || bad "config --porcelain: liczba wierszy ($out)"
+[ "$(printf '%s\n' "$out" | head -n1 | awk -F'\t' '{print NF}')" = 4 ] && ok "config --porcelain: 4 pola" || bad "config --porcelain: liczba pól"
+[ "$(printf '%s\n' "$out" | awk -F'\t' '{print $1}' | tr '\n' ' ')" = "WT_DIR WT_BASE WT_LINK WT_FETCH WT_TEST WT_POST_NEW " ] && ok "config --porcelain: kolejność kluczy" || bad "config --porcelain: kolejność kluczy"
+contains "config --porcelain: domyślna WT_DIR" "$out" "$(printf 'WT_DIR\tdomyślna\t.claude/worktrees\t.claude/worktrees')"
+contains "config --porcelain: puste pole bez (puste)" "$out" "$(printf 'WT_BASE\tdomyślna\t\t')"
+printf 'WT_DIR=../x-wt\nWT_TEST=echo a\tb\n' > .git/wt.conf
+printf 'WT_LINK=.env.local\nWT_POST_NEW=evil\n' > .wt.conf
+out=$(WT_FETCH=0 $WT config --porcelain 2>/dev/null)
+contains "config --porcelain: źródło .git/wt.conf" "$out" "$(printf 'WT_DIR\trepo (.git/wt.conf)\t../x-wt\t.claude/worktrees')"
+contains "config --porcelain: źródło .wt.conf" "$out" "$(printf 'WT_LINK\trepo (.wt.conf)\t.env.local\t.env .venv')"
+contains "config --porcelain: źródło env" "$out" "$(printf 'WT_FETCH\tenv\t0\t1')"
+contains "config --porcelain: tab w wartości zamieniony na spację" "$out" "$(printf 'WT_TEST\trepo (.git/wt.conf)\techo a b\t')"
+case "$out" in *evil*) bad "config --porcelain: WT_POST_NEW z .wt.conf ma być zignorowany" ;; *) ok "config --porcelain: komenda z .wt.conf zignorowana" ;; esac
+rm -f .git/wt.conf .wt.conf
+check_fail "config: nieznana opcja" $WT config --bogus
+
 cd "$R" || exit 1
 # shellcheck disable=SC2086
 rm -rf $FC

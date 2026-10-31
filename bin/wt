@@ -237,7 +237,7 @@ usage() {
     printf '  merge <temat>           testy, rebase, testy, merge --ff-only\n'
     printf '  drop <temat>            usuń worktree i gałąź (tylko gdy bezpieczne)\n'
     printf '  ui                      interfejs w terminalu (curses)\n'
-    printf '  config                  efektywna konfiguracja i jej źródła\n\n'
+    printf '  config [--porcelain]    efektywna konfiguracja i jej źródła\n\n'
     printf 'Repo: %s\n' "${repo:-(poza repo git)}"
   } >&2
   exit 1
@@ -252,8 +252,23 @@ repo_main_quiet() {
 }
 
 cmd_config() {
-  local key val src
+  local key val src def porcelain=0
+  case "${1:-}" in
+    --porcelain) porcelain=1 ;;
+    "") ;;
+    *) die "nieznana opcja: $1 (użycie: wt config [--porcelain])" ;;
+  esac
   init_repo
+  if [ "$porcelain" = 1 ]; then
+    # key<TAB>source<TAB>value<TAB>default; tabs inside values become spaces to keep TSV intact.
+    for key in $ALL_KEYS; do
+      eval "val=\$CFG_$key"
+      eval "src=\$SRC_$key"
+      eval "def=\$DEFAULT_$key"
+      printf '%s\t%s\t%s\t%s\n' "$key" "$src" "${val//$'\t'/ }" "${def//$'\t'/ }"
+    done
+    return 0
+  fi
   info "repo:  $MAIN"
   info "baza:  $BASE"
   info "wt:    $WT_ROOT"
