@@ -403,6 +403,22 @@ def parse_config(text):
     return items
 
 
+def conf_problems(text):
+    """Lines of a wt.conf that `wt` would silently ignore: no '=' or an unknown key. Pure."""
+    problems = []
+    for n, line in enumerate(text.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            problems.append("linia %d: brak '=' (zignorowana)" % n)
+            continue
+        key = re.sub(r"\s+", "", line.split("=", 1)[0])
+        if key not in CONFIG_HELP:
+            problems.append("linia %d: nieznany klucz %s (zignorowany)" % (n, key))
+    return problems
+
+
 def config_notes(item):
     """Short explanation lines for one config item: [(text, style-name)]. Pure."""
     desc, shared_ok = CONFIG_HELP.get(item["key"], ("", False))
@@ -1477,7 +1493,7 @@ class App:
             flat += [(l, style) for l in textwrap.wrap(text, max(10, iw))]
         for n, (text, style) in enumerate(flat[-3:]):
             self.put(h - 1 - len(flat[-3:]) + n, 2, text, self.c[style], iw)
-        self.put(h - 1, 3, " j/k ruch  Enter edytuj  d przywróć domyślną  Esc wróć ", self.c["dim"], max(0, w - 6))
+        self.put(h - 1, 3, " j/k ruch  Enter edytuj  d przywróć domyślną  E plik w edytorze  Esc wróć ", self.c["dim"], max(0, w - 6))
 
     def config_screen(self):
         """Config screen: browse the effective config and edit keys through `wt config set/unset`.
@@ -1520,6 +1536,8 @@ class App:
                     if self.cancelled:
                         continue
                     changed |= self.config_apply(["set", it["key"], value])
+                elif key == ord("E"):
+                    changed |= self.config_edit_file()
                 elif key == ord("d"):
                     if self.confirm("Usunąć %s z .git/wt.conf (wróci wartość z niższego źródła)?" % it["key"]):
                         changed |= self.config_apply(["unset", it["key"]])
@@ -1528,6 +1546,37 @@ class App:
         if changed:
             self.reload()
             self.message = "+ zapisano konfigurację"
+
+    def config_edit_file(self):
+        """Open the private .git/wt.conf in $VISUAL/$EDITOR (curses suspended), then re-read the config."""
+        if not self.main:
+            self.modal("Błąd", "Nie znaleziono głównego checkoutu.")
+            return False
+        path = os.path.join(self.main["path"], ".git", "wt.conf")
+        editor = shlex.split(os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vi")
+        before = open(path).read() if os.path.exists(path) else None
+        curses.def_prog_mode()
+        curses.endwin()
+        err = ""
+        try:
+            subprocess.call(editor + [path])
+        except OSError as e:
+            err = "Nie udało się uruchomić edytora '%s': %s" % (" ".join(editor), e)
+        curses.reset_prog_mode()
+        self.scr.clear()
+        self.scr.refresh()
+        if err:
+            self.modal("Błąd", err)
+            return False
+        after = open(path).read() if os.path.exists(path) else None
+        items, _ = self.config_load()
+        if items:
+            self.cfg["items"] = items
+            self.cfg["cur"] = min(self.cfg["cur"], len(items) - 1)
+        notes = [("Plik .git/wt.conf zmieniony.", "green")] if after != before else [("Bez zmian.", "dim")]
+        notes += [(l, "yellow") for l in conf_problems(after or "")]
+        self.cfg["notes"] = notes
+        return after != before
 
     def config_apply(self, args):
         """Run `wt config set|unset ...`; show errors in the red modal, results in the screen footer."""

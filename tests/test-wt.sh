@@ -597,6 +597,9 @@ assert desc and any("środowiskow" in t for t, _ in notes) and any("dozwolony." 
 _, notes = m.config_notes({"key": "WT_POST_NEW", "source": "repo (.git/wt.conf)", "value": "x", "default": ""})
 assert any("niedozwolony" in t for t, _ in notes) and not any("środowiskow" in t for t, _ in notes)
 assert any(k == "C" for _, es in m.MENU for k, _ in es)
+assert m.conf_problems("# c\nWT_DIR=x\n  WT_FETCH = 0\n\nWT_FTCH=1\nbez-rownosci\n") == [
+    "linia 5: nieznany klucz WT_FTCH (zignorowany)", "linia 6: brak '=' (zignorowana)"]
+assert m.conf_problems("") == []
 print("KEYS:" + " ".join(sorted(m.CONFIG_HELP)))
 print("SAFE:" + " ".join(sorted(k for k, (_, ok) in m.CONFIG_HELP.items() if ok)))
 print("AKCJE-OK")
@@ -623,7 +626,7 @@ pid, fd = pty.fork()
 if pid == 0:
     os.chdir(repo)
     env = {k: v for k, v in os.environ.items() if not k.startswith("WT_")}
-    env.update(TERM="xterm-256color", LANG="en_US.UTF-8", LC_ALL="en_US.UTF-8", WT_CMD=wt)
+    env.update(TERM="xterm-256color", LANG="en_US.UTF-8", LC_ALL="en_US.UTF-8", WT_CMD=wt, VISUAL=repo + "/ed.sh")
     os.execve(sys.executable, [sys.executable, ui], env)
 fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
 buf = b""
@@ -646,6 +649,12 @@ res.append(("error-modal", "przyjmuje 0 albo 1" in txt() and rd() == "WT_FETCH=0
 key(b"\r", 0.5)                                             # dismiss the modal
 key(b"d", 0.5); key(b"n", 0.5); res.append(("unset-declined", rd() == "WT_FETCH=0\n"))
 key(b"d", 0.5); key(b"y", 1.2); res.append(("unset", rd() == ""))
+ed = repo + "/ed.sh"
+open(ed, "w").write('#!/bin/sh\nprintf "WT_FETCH=0\\nWT_FTCH=1\\n" >> "$1"\n')
+os.chmod(ed, 0o755)
+buf = b""; key(b"E", 1.5)
+res.append(("editor-file", rd() == "WT_FETCH=0\nWT_FTCH=1\n"))
+res.append(("editor-typo-warning", "nieznany klucz WT_FTCH" in txt()))
 key(b"\x1b", 1.0); key(b"q", 0.5)
 shutil.rmtree(repo, ignore_errors=True)
 print(" ".join("%s=%s" % (n, "ok" if v else "FAIL") for n, v in res))
