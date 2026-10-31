@@ -171,7 +171,7 @@ WT_POST_NEW=npm install
 
 ## 5. `wt ui`
 
-Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wiek), szczegóły po prawej, na górze nagłówek (`k` z pierwszego worktree przechodzi na niego i pokazuje szczegóły głównego checkoutu: origin w tyle/do przodu, zmiany). Stan PR i CI pochodzi z GitHuba (`gh pr list` w tle).
+Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wiek), szczegóły po prawej, na górze nagłówek (`k` z pierwszego worktree przechodzi na niego i pokazuje szczegóły głównego checkoutu: origin w tyle/do przodu, zmiany). Stan PR i CI pochodzi z GitHuba (`gh pr list` w tle). W szczegółach worktree każdy commit ponad bazą ma znacznik: `✓` jest już na origin, `↑` tylko lokalnie (do wypchnięcia). Liczone z refów `origin/*` z ostatniego fetch, bez sieci.
 
 | Klawisz | Akcja |
 |---|---|
@@ -179,7 +179,8 @@ Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wi
 | `Space` | menu skrótów w kategoriach (Wybrane worktree, Nawigacja, Widok, Ogólne) |
 | `n` | modal nowego worktree (nazwa, target branch, tytuł) |
 | `t` | testy w sfokusowanym worktree |
-| `c` | kopiuje `cd <ścieżka>` do schowka (`pbcopy`) |
+| `c` | podmenu Kopiuj (`pbcopy`): `c` kopiuje `cd <ścieżka>`, `u` kopiuje URL PR (wyłączone, gdy brak PR), `h`/`Esc` wstecz |
+| `o` | podmenu Otwórz: `c` otwiera worktree w VS Code (`code`, a bez niego `open -a "Visual Studio Code"`), `b` otwiera PR gałęzi w przeglądarce, `t` sesja tmux (na razie wyłączone), `h`/`Esc` wstecz |
 | `p` | podmenu PR: `p` push / utwórz PR (draft), `d` draft <-> ready, `m` merge PR, `M` merge + usuń worktree, `c` zamknij PR. Niedostępne opcje są wygaszone zgodnie ze stanem PR |
 | `x` | `wt drop` (z `--merged-pr`, gdy PR zmergowany) |
 | `C` | ekran konfiguracji: `j`/`k`, `Enter` edytuj klucz, `d` przywróć domyślną, `E` otwórz `.git/wt.conf` w `$VISUAL`/`$EDITOR`, `Esc` wróć |
