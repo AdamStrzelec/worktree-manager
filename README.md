@@ -10,9 +10,8 @@ Pełny opis działania, konfiguracji i planów jest w [docs/wt-manager.md](docs/
 |---|---|
 | `wt new`, `wt list`, `wt status`, `wt test`, `wt config` | gotowe i przetestowane |
 | `wt ui` | gotowe: interfejs w terminalu (wymaga `python3`), testowane tylko ręcznie i pty-smoke |
-| `wt merge`, `wt drop` | jeszcze niezaimplementowane (komenda zwraca błąd "jeszcze niezaimplementowana") |
-
-Do czasu wdrożenia `merge` i `drop` zmergowanie i sprzątanie robi się ręcznie gitem (patrz "Sprzątanie" niżej).
+| `wt drop` | gotowe i przetestowane (patrz "Usuwanie worktree" niżej) |
+| `wt merge` | jeszcze niezaimplementowane (komenda zwraca błąd "jeszcze niezaimplementowana"); zmergowanie robi się ręcznie gitem albo przez PR w `wt ui` |
 
 ## Wymagania
 
@@ -92,7 +91,7 @@ wt status
 - `wt test` uruchamia testy w bieżącym worktree (komenda z konfiguracji, z pliku `.wt-test` albo wykryta automatycznie).
 - `wt list` pokazuje worktree: wiek ostatniego commita, liczbę commitów ponad bazą, liczbę brudnych plików i właściciela.
 - `wt status` wykrywa kolizje: pliki zmieniane jednocześnie w więcej niż jednym worktree.
-- `wt ui` otwiera interfejs: lista worktree po lewej, szczegóły i kolizje po prawej. Klawisze: `j`/`k` lub strzałki, `g`/`G`, `n` nowy worktree, `t` testy, `c` kopiuje `cd <ścieżka>` do schowka (`pbcopy`), `r` odśwież, `/` filtr, `q` wyjście.
+- `wt ui` otwiera interfejs: lista worktree po lewej, szczegóły i kolizje po prawej. Klawisze: `j`/`k` lub strzałki, `g`/`G`, `n` nowy worktree, `t` testy, `c` kopiuje `cd <ścieżka>` do schowka (`pbcopy`), `p` push/PR, `d` draft/ready, `m` merge PR, `x` usuń worktree, `M` merge + usuń (szczegóły niżej), `r` odśwież, `/` filtr, `q` wyjście.
 - `wt list --porcelain` daje wyjście dla skryptów: ścieżka, gałąź, wiek, ahead, brudne, właściciel, rozdzielone tabulatorem.
 
 Komendy działają z dowolnego miejsca repo, także z wnętrza worktree.
@@ -124,9 +123,25 @@ Sprawdzenie, co jest ustawione i skąd pochodzi każda wartość:
 wt config
 ```
 
-## Sprzątanie (do czasu `wt drop`)
+## Usuwanie worktree i akcje na PR
 
-Zmergowanie gałęzi na bazę i usunięcie worktree robi się na razie ręcznie, z głównego checkoutu:
+`wt drop <temat>` usuwa worktree (`git worktree remove`, bez force) i gałąź (`git branch -d`, nigdy `-D`) oraz kasuje `branch.<n>.wt-*` z configu. Odmawia, gdy: są niezacommitowane zmiany, gałąź ma commity niezmergowane do targetu (`wt-target`, a bez niego bazy), właściciel (`.wt-owner`) żyje (poza procesem, który sam wywołuje `drop`), albo stoisz w tym worktree. Opcje: `--check` (tylko sprawdza, nic nie usuwa), `--merged-pr` (wywołujący zapewnia, że PR jest zmergowany na GitHubie, więc commity niezmergowane lokalnie są dozwolone; gałąź i tak musi być zmergowana do swojego upstreamu lub HEAD, bo inaczej `branch -d` odmówi).
+
+W `wt ui` na sfokusowanym worktree (też pod Spacją), każda akcja pokazuje modal z opisem i dokładną komendą, a błędy trafiają do czerwonego modala:
+
+| Klawisz | Akcja |
+|---|---|
+| `p` | `git push -u origin <gałąź>` i, jeśli nie ma otwartego PR, `gh pr create --draft` (base z `wt-target`, tytuł z `wt-title` lub nazwa gałęzi) |
+| `d` | draft <-> ready (`gh pr ready` / `--undo`) |
+| `m` | `gh pr merge <nr> --merge` (tylko otwarty, nie draft, bez konfliktów, CI nie czerwone) |
+| `x` | `wt drop` (z `--merged-pr`, gdy PR jest zmergowany) |
+| `M` | sprawdzenie `wt drop --check`, merge PR, potem `wt drop` |
+
+Push i `gh` żyją wyłącznie w `wt-ui`, po potwierdzeniu, nigdy z force. Stan PR zawsze pochodzi z GitHuba (po akcji UI odpytuje `gh` ponownie). Wymaga `gh` w PATH i `gh auth login`; bez tego akcje na PR pokazują czytelny błąd (sam push działa bez `gh`).
+
+## Sprzątanie ręczne
+
+Zmergowanie gałęzi na bazę i usunięcie worktree możesz też zrobić ręcznie, z głównego checkoutu:
 
 ```bash
 git merge --ff-only moj-feature
@@ -136,7 +151,7 @@ git merge --ff-only moj-feature
 git worktree remove <ścieżka-worktree> && git branch -d moj-feature
 ```
 
-`wt` nigdy sam nie robi `push`, `reset --hard`, `git add -A` ani force.
+Skrypt `bin/wt` nigdy nie robi `push`, `reset --hard`, `git add -A` ani force; push i `gh` to jawne akcje w `wt ui`.
 
 ## Aktualizacja i odinstalowanie
 

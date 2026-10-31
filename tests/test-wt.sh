@@ -169,6 +169,27 @@ assert len(rows) == 1 and rows[0]["branch"] == "feat-a" and rows[0]["owner"].sta
 c = m.parse_collisions("KOLIZJA a ↔ b:\n  x.txt\n  y/z.txt\nbrak\n")
 assert c["a"][0][0] == "b" and c["b"][0][0] == "a" and c["a"][0][1] == ["x.txt", "y/z.txt"], c
 assert m.parse_base("repo:  /r\nbaza:  main\n") == "main"
+import json, tempfile, os, time
+assert m.parse_branch_config("branch.feat.x.wt-title Moj task\nbranch.b.wt-title \n", "wt-title") == {"feat.x": "Moj task"}
+assert m.fmt_age(None) == "?" and m.fmt_age(100, 130) == "teraz" and m.fmt_age(0, 7200) == "2h" and m.fmt_age(0, 86400 * 3) == "3d"
+d = tempfile.mkdtemp()
+open(os.path.join(d, ".wt-owner"), "w").write('{"pid":1,"time":"2020-01-02T03:04:05+0000"}')
+assert abs(m.created_ts(d) - 1577934245) < 1
+assert m.created_ts(d + "/nie-ma") is None
+ok_ = {"conclusion": "SUCCESS", "status": "COMPLETED"}
+assert m.ci_state([]) == "none" and m.ci_state([ok_]) == "green"
+assert m.ci_state([ok_, {"status": "IN_PROGRESS", "conclusion": ""}]) == "yellow"
+assert m.ci_state([ok_, {"status": "COMPLETED", "conclusion": "FAILURE"}, {"status": "QUEUED"}]) == "red"
+assert m.ci_state([{"state": "PENDING"}]) == "yellow" and m.ci_state([{"state": "ERROR"}]) == "red"
+prs = m.parse_prs(json.dumps([
+    {"number": 5, "headRefName": "a", "isDraft": False, "state": "MERGED", "mergeable": "UNKNOWN", "statusCheckRollup": []},
+    {"number": 9, "headRefName": "a", "isDraft": True, "state": "OPEN", "mergeable": "CONFLICTING", "statusCheckRollup": [ok_]},
+    {"number": 7, "headRefName": "b", "isDraft": False, "state": "CLOSED"}, {"headRefName": "x"}, "junk"]))
+assert prs["a"]["number"] == 9 and prs["a"]["draft"] and prs["a"]["ci"] == "green" and prs["a"]["mergeable"] == "CONFLICTING", prs
+assert prs["b"]["state"] == "CLOSED" and "x" not in prs
+assert m.parse_prs("nie json") == {} and m.parse_prs("{}") == {}
+assert m.check_list([{"name": "build", "status": "COMPLETED", "conclusion": "SUCCESS"}, {"context": "ci/x", "state": "PENDING"}, "x"]) == [("build", "green"), ("ci/x", "yellow")]
+assert m.parse_conflict_files("abc123\nsrc/a.txt\nb.txt\n\nAuto-merging") == ["src/a.txt", "b.txt"] and m.parse_conflict_files("abc") == []
 print("PARSERY-OK")
 PY
 )
@@ -371,6 +392,207 @@ check_fail "sama flaga bez nazwy" $WT new --no-fetch
 cd "$R" || exit 1
 # shellcheck disable=SC2086
 rm -rf $FC
+
+echo "-- drop"
+D=$(mkrepo); DO=$(mktemp -d)
+cd "$D" || exit 1
+git init -q --bare "$DO"
+git remote add origin "$DO"; git push -q origin main 2>/dev/null
+check_fail "drop bez argumentu" $WT drop
+check_fail "drop nieistniejący" $WT drop nie-ma
+# worktrees get a dead owner pid (creator subshell exits), like a finished session
+newd() { ( $WT new "$@" >/dev/null 2>&1; true ); }
+newd d1 --no-fetch --title "T"
+out=$($WT drop d1 --check 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ -d .claude/worktrees/d1 ] && ok "drop --check nic nie usuwa" || bad "drop --check: rc=$rc $out"
+out=$($WT drop d1 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "drop czysty exit 0" || bad "drop czysty rc=$rc: $out"
+check_fail "drop: katalog zniknął" test -e .claude/worktrees/d1
+check_fail "drop: gałąź zniknęła" git rev-parse --verify --quiet refs/heads/d1
+[ -z "$(git config --get-regexp '^branch\.d1\.' 2>/dev/null)" ] && ok "drop: config wt-* skasowany" || bad "drop: config został"
+# dirty
+newd d2 --no-fetch; echo x > .claude/worktrees/d2/u.txt
+out=$($WT drop d2 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "drop brudny: odmowa" || bad "drop brudny przeszedł"
+contains "drop brudny: komunikat" "$out" "niezacommitowane"
+check "drop brudny: worktree zostaje" test -d .claude/worktrees/d2
+# unmerged commits
+newd d3 --no-fetch
+echo c > .claude/worktrees/d3/c.txt; git -C .claude/worktrees/d3 add c.txt; git -C .claude/worktrees/d3 commit -q -m c
+out=$($WT drop d3 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "drop niezmergowany: odmowa" || bad "drop niezmergowany przeszedł"
+contains "drop niezmergowany: komunikat" "$out" "niezmergowanych"
+out=$($WT drop d3 --merged-pr 2>&1); rc=$?
+[ "$rc" -ne 0 ] && [ -d .claude/worktrees/d3 ] && ok "--merged-pr bez upstreamu: odmowa, nic nie usunięte" || bad "--merged-pr bez upstreamu: rc=$rc $out"
+git -C .claude/worktrees/d3 push -q -u origin d3 2>/dev/null
+out=$($WT drop d3 --merged-pr 2>&1); rc=$?
+[ "$rc" -eq 0 ] && [ ! -e .claude/worktrees/d3 ] && ok "drop --merged-pr (PR zmergowany) usuwa" || bad "drop --merged-pr rc=$rc $out"
+# merged locally
+newd d4 --no-fetch
+echo m > .claude/worktrees/d4/m.txt; git -C .claude/worktrees/d4 add m.txt; git -C .claude/worktrees/d4 commit -q -m m
+git merge -q --ff-only d4
+out=$($WT drop d4 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "drop po zmergowaniu do targetu" || bad "drop po merge rc=$rc $out"
+# live owner (a different process than the caller)
+newd d5 --no-fetch
+sleep 30 & SLP=$!
+printf '{"session":"","pid":%s,"pane":"","time":"x","user":"u"}\n' "$SLP" > .claude/worktrees/d5/.wt-owner
+out=$($WT drop d5 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "drop żywy właściciel: odmowa" || bad "drop żywy właściciel przeszedł"
+contains "drop właściciel: komunikat" "$out" "zajęty"
+kill "$SLP" 2>/dev/null; wait "$SLP" 2>/dev/null
+out=$($WT drop d5 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "drop po śmierci właściciela" || bad "drop martwy właściciel rc=$rc $out"
+# inside the worktree itself
+newd d6 --no-fetch
+out=$(cd .claude/worktrees/d6 && $WT drop d6 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "drop z wnętrza worktree: odmowa" || bad "drop z wnętrza przeszedł"
+# custom target: unmerged relative to wt-target
+git branch dev-y; newd d7 --no-fetch --target dev-y
+echo q > .claude/worktrees/d7/q.txt; git -C .claude/worktrees/d7 add q.txt; git -C .claude/worktrees/d7 commit -q -m q
+git merge -q --ff-only d7 2>/dev/null
+out=$($WT drop d7 2>&1); rc=$?
+[ "$rc" -ne 0 ] && contains "drop liczy względem wt-target" "$out" "'dev-y'" || bad "drop zignorował wt-target"
+cd "$R" || exit 1
+rm -rf "$D" "$DO"
+
+echo "-- ui: akcje (czyste funkcje)"
+out=$(python3 - "$UIBIN" <<'PY' 2>&1
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("wt_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("wt_ui", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+row = {"branch": "feat-a", "path": "/r/wt/feat-a"}
+meta = {"title": "Mój tytuł", "target": "dev"}
+def pr(**kw):
+    d = {"number": 7, "draft": False, "state": "OPEN", "mergeable": "MERGEABLE", "ci": "green", "url": "", "checks": [], "base": "dev"}
+    d.update(kw); return d
+def plan(kind, p=None, status="ok", gh=True, meta=meta):
+    return m.plan_action(kind, row, meta, p, "main", status, gh, "WT")
+r = plan("push")
+assert [s["argv"] for s in r["steps"]] == [["git", "push", "-u", "origin", "feat-a"],
+    ["gh", "pr", "create", "--draft", "--base", "dev", "--head", "feat-a", "--title", "Mój tytuł", "--body", ""]], r
+assert not any("--force" in a or "-f" == a for s in r["steps"] for a in s["argv"])
+r = plan("push", meta={})
+assert r["steps"][1]["argv"][r["steps"][1]["argv"].index("--title") + 1] == "feat-a" and "main" in r["steps"][1]["argv"]
+assert len(plan("push", pr())["steps"]) == 1 and len(plan("push", gh=False, status="off")["steps"]) == 1
+assert "error" in plan("push", status="err") and "error" in plan("push", status="loading")
+assert plan("ready", pr(draft=True))["steps"][0]["argv"] == ["gh", "pr", "ready", "7"]
+assert plan("ready", pr())["steps"][0]["argv"] == ["gh", "pr", "ready", "7", "--undo"]
+assert "error" in plan("ready") and "error" in plan("ready", pr(state="MERGED")) and "error" in plan("ready", pr(), gh=False)
+assert plan("merge", pr())["steps"][0]["argv"] == ["gh", "pr", "merge", "7", "--merge"]
+for bad in (pr(draft=True), pr(state="CLOSED"), pr(mergeable="CONFLICTING"), pr(mergeable="UNKNOWN"), pr(ci="red")):
+    assert "error" in plan("merge", bad), bad
+    assert "error" in plan("mergedrop", bad), bad
+assert "error" in plan("merge")
+r = plan("merge", pr(ci="yellow")); assert "UWAGA" in " ".join(r["lines"])
+r = plan("mergedrop", pr())
+assert [s["argv"] for s in r["steps"]] == [["WT", "drop", "feat-a", "--merged-pr", "--check"],
+    ["gh", "pr", "merge", "7", "--merge"], ["WT", "drop", "feat-a", "--merged-pr"]], r
+assert plan("drop")["steps"][0]["argv"] == ["WT", "drop", "feat-a"]
+assert plan("drop", pr(state="MERGED"))["steps"][0]["argv"] == ["WT", "drop", "feat-a", "--merged-pr"]
+assert plan("drop", status="err", gh=False)["steps"]
+assert m.display_cmd(["WT", "drop", "a b"], "WT") == "wt drop 'a b'"
+assert set(m.ACTION_KEYS.values()) == {"push", "ready", "merge", "drop", "mergedrop"}
+assert not {ord(c) for c in "ntcrqgGjk/ "} & set(m.ACTION_KEYS)
+print("AKCJE-OK")
+PY
+)
+contains "plan_action i pochodne" "$out" "AKCJE-OK"
+
+echo "-- ui: smoke w pty z fałszywym gh"
+SB=$(mktemp -d); mkdir -p "$SB/bin"
+cat > "$SB/bin/gh" <<'GH'
+#!/bin/sh
+echo "$*" >> "$FAKE_GH_DIR/calls.log"
+P="$FAKE_GH_DIR/prs.json"
+case "$1 $2" in
+  "pr list") cat "$P" ;;
+  "pr create") printf '[{"number":1,"headRefName":"feat-ui","baseRefName":"main","isDraft":true,"state":"OPEN","mergeable":"MERGEABLE","statusCheckRollup":[],"url":"https://example.invalid/pr/1"}]' > "$P" ;;
+  "pr ready") case "$*" in *--undo*) sed 's/"isDraft":false/"isDraft":true/' "$P" > "$P.n" ;; *) sed 's/"isDraft":true/"isDraft":false/' "$P" > "$P.n" ;; esac; mv "$P.n" "$P" ;;
+  "pr merge") sed 's/"state":"OPEN"/"state":"MERGED"/' "$P" > "$P.n"; mv "$P.n" "$P" ;;
+esac
+exit 0
+GH
+chmod +x "$SB/bin/gh"
+cat > "$SB/drive.py" <<'PY'
+import fcntl, os, pty, select, struct, sys, termios, time
+wt_sh, wt_bin, cwd, scen = sys.argv[1:5]
+gd = os.environ["FAKE_GH_DIR"]
+def log():
+    try: return open(gd + "/calls.log").read()
+    except OSError: return ""
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(cwd)
+    os.environ["TERM"] = "xterm-256color"
+    os.execvp(wt_sh, [wt_sh, wt_bin, "ui"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+buf = b""
+def pump(sec):
+    global buf
+    end = time.time() + sec
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try: d = os.read(fd, 65536)
+            except OSError: return
+            if not d: return
+            buf += d
+def send(s): os.write(fd, s.encode())
+def until(cond, to=10):
+    end = time.time() + to
+    while time.time() < end:
+        pump(0.2)
+        if cond(): return True
+    return False
+def count(s): return log().count(s)
+def act(key, confirm=True):
+    send(key); pump(0.6)
+    if confirm: send("y")
+res = []
+pump(2)
+if scen == "full":
+    act("p"); res.append(("create", until(lambda: "pr create" in log())))
+    until(lambda: count("pr list") >= 2); pump(1)
+    res.append(("create-args", "--draft --base main --head feat-ui --title Tytul UI" in log()))
+    n = count("pr merge"); act("m", confirm=False); pump(1); send("\r"); pump(0.5)
+    res.append(("merge-refused-draft", count("pr merge") == n))
+    act("d"); res.append(("ready", until(lambda: "pr ready 1\n" in log()))); until(lambda: count("pr list") >= 4); pump(1)
+    act("d"); res.append(("undo", until(lambda: "pr ready 1 --undo" in log()))); until(lambda: count("pr list") >= 5); pump(1)
+    act("d"); until(lambda: log().count("pr ready 1\n") >= 2); until(lambda: count("pr list") >= 6); pump(1)
+    act("M"); res.append(("merge", until(lambda: "pr merge 1 --merge" in log())))
+    res.append(("dropped", until(lambda: not os.path.exists(cwd + "/.claude/worktrees/feat-ui"), 10)))
+else:  # noorigin: push fails, must show an error and survive
+    act("p"); pump(2)
+    res.append(("no-create", "pr create" not in log()))
+    send("\r"); pump(0.5)
+send("q"); pump(1)
+try:
+    _, st = os.waitpid(pid, os.WNOHANG)
+except ChildProcessError:
+    st = 0
+res.append(("alive-then-quit", True))
+for k, v in res: print(("OK " if v else "NO ") + k)
+PY
+mkui() { # mkui DIR-VAR: repo + worktree feat-ui with one commit
+  local t; t=$(mkrepo); (cd "$t" && ( $WT new feat-ui --no-fetch --title "Tytul UI" >/dev/null 2>&1; true )
+  echo f > "$t/.claude/worktrees/feat-ui/f.txt"; git -C "$t/.claude/worktrees/feat-ui" add f.txt
+  git -C "$t/.claude/worktrees/feat-ui" commit -q -m f); printf '%s' "$t"
+}
+U=$(mkui); UO=$(mktemp -d); git init -q --bare "$UO"
+git -C "$U" remote add origin "$UO"; git -C "$U" push -q origin main 2>/dev/null
+mkdir "$SB/gh1"; printf '[]' > "$SB/gh1/prs.json"
+out=$(cd "$SB" && PATH="$SB/bin:$PATH" FAKE_GH_DIR="$SB/gh1" python3 "$SB/drive.py" "$SH" "$WT_BIN" "$U" full 2>&1)
+for k in create create-args merge-refused-draft ready undo merge dropped alive-then-quit; do
+  case "$out" in *"OK $k"*) ok "ui smoke: $k" ;; *) bad "ui smoke: $k ($out)" ;; esac
+done
+check "ui smoke: gałąź wypchnięta do lokalnego origin" git --git-dir="$UO" rev-parse --verify --quiet refs/heads/feat-ui
+check_fail "ui smoke: gałąź lokalna usunięta po merge+drop" git -C "$U" rev-parse --verify --quiet refs/heads/feat-ui
+U2=$(mkui); mkdir "$SB/gh2"; printf '[]' > "$SB/gh2/prs.json"
+out=$(cd "$SB" && PATH="$SB/bin:$PATH" FAKE_GH_DIR="$SB/gh2" python3 "$SB/drive.py" "$SH" "$WT_BIN" "$U2" noorigin 2>&1)
+case "$out" in *"OK no-create"*"OK alive-then-quit"*) ok "ui smoke: brak origin = błąd w modalu, bez crasha" ;; *) bad "ui smoke noorigin ($out)" ;; esac
+rm -rf "$SB" "$U" "$U2" "$UO"
 
 echo "-- poza repo"
 out=$(cd / && $WT list 2>&1); rc=$?

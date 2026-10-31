@@ -1,10 +1,10 @@
  TODO:
  Skroty dla pojedynczego wt w UI:
-[ ] - mozliwosc spushowania i/lub utworzenia PR
+[x] - mozliwosc spushowania i/lub utworzenia PR
 [ ] - mozliwosc edycji PR - np. zmiana jego statusu na draft i zeby dzialalo to w obydwie strony czyli z poziomu wt UI -> zmienia sie na origin i odwrotnie + w task TUI
-[ ] - mozliwosc zmergowania PR
-[ ] - mozliwosc usuniecia worktree - jesli nie ma przeciwwskazan
-[ ] - mozliwosc zmergowania + usuniecia worktree - jesli zostana spelnine odpowiednie warunki
+[x] - mozliwosc zmergowania PR
+[x] - mozliwosc usuniecia worktree - jesli nie ma przeciwwskazan
+[x] - mozliwosc zmergowania + usuniecia worktree - jesli zostana spelnine odpowiednie warunki
 
 Mozliwosc bezposredniego otwarcia z poziomu UI lub aliasem z poziomu terminala takich narzedzi jak:
 [ ] - VS Code z worktree,
@@ -18,8 +18,9 @@ Edycja configu z poziomu UI
 [ ] - mozliwosc zdefiniowania czy i w jaki sposob maja sie tworzyc i USUWAC automatycznie inne rzeczy wraz z utworzeniem i usunieciem worktree jak np. sesje tmuxa wraz z odpowiednia nazwa itd. - DO USTALENIA
 
 Tworzenie worktree z poziomu UI
-[ ] - zamiast pojedynczego inputa do wpisywania nazwy nowego worktree dodac modal, w ktorym dodatkowo bedzie mozna wybrac target branch sposrod dostepnych
-[ ] - Dodatkowy input na tytuł, który będzie sobie mozna wyświetlić w szczegółach worktree
+[x] - zamiast pojedynczego inputa do wpisywania nazwy nowego worktree dodac modal, w ktorym dodatkowo bedzie mozna wybrac target branch sposrod dostepnych
+[x] - Dodatkowy input na tytuł, który będzie sobie mozna wyświetlić w szczegółach worktree
+[ ] - Przetestowac czy odpowinio sie to robi tak jak trzeba i czy bedzie sie to mergowac do target brancha
 
 Widok UI - ogolne poprawki
 [ ] - dodac jakis autorefresh co okreslony interwal czasowy aby nam sie odswiezala zawartosci widoku panelu UI kiedy w krotkim czasie zostana dodane np. nowe commity lub niezacommitowane zmiany
@@ -27,13 +28,14 @@ Widok UI - ogolne poprawki
 
 Widok listy z utworzonymi worktreesami - szczegóły pojedynczego itemu i co sie ma w nim znajdowac
 [x] - nazwa galezi (juz jest)
-[ ] - Tytul taska - z task TUI
+[x] - Tytul taska - z task TUI
 [ ] - info o PR - jesli jest utworzony PR - czyli jesli pr ma nr. 50 to ma sie wyświetlać "PR #50"
 [ ] - info o statusie PR - np. ze ma status draft
 [ ] - info o potencjalnych konfliktach do rozwiazania
 [ ] - info o statusie CI - i jakas ikonka zielona, zolta lub czerwona w zaleznosci od statusu
-[ ] - wiek czyli jak dawno temu zostal ten worktree utworzony
-[ ] - pola ahead i brudne zostają tylko trzeba im lepsze tytuły wymyslić (rowniez w widoku szczegolow)
+[x] - wiek czyli jak dawno temu zostal ten worktree utworzony
+[x] - pola ahead i brudne zostają tylko trzeba im lepsze tytuły wymyslić (rowniez w widoku szczegolow)
+[x] - ogarnac jeszcze ten backgreound i kolory fontow jak jestesmy sfokusowani na liscie na jakims worktree + dodac jakies bordery i/lub spacingi pomiedzy itemami na liscie
 DO ZAPAMIETAMIN JEDNA RZECZ - te rzeczy, ktore wymienilem jako elementy pojedynczego itemu na liście nie muszą byc wyswietlane w pojedynczym wierszu na kazdy item, a np. w 2/3 wierszach bo tych worktrees raczej nie bedzie jakos bardzo duzo
 
 Widok szczegółów dla sfokusowanego worktree
