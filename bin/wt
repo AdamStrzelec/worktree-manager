@@ -896,15 +896,52 @@ find_worktree() {
   return 1
 }
 
+# wt_procs DIR - "pid<TAB>command" for every other process whose working directory is inside DIR
+# (dev servers, watchers, shells). Needs lsof; prints nothing when it is missing.
+wt_procs() {
+  local real
+  command -v lsof >/dev/null 2>&1 || return 0
+  real=$(cd "$1" 2>/dev/null && pwd -P) || return 0
+  lsof -a -d cwd -Fpcn 2>/dev/null | awk -v dir="$real" -v self="$$" -v ppid="$PPID" '
+    /^p/ { pid = substr($0, 2); cmd = "" }
+    /^c/ { cmd = substr($0, 2) }
+    /^n/ { n = substr($0, 2)
+           if ((n == dir || index(n, dir "/") == 1) && pid != self && pid != ppid) printf "%s\t%s\n", pid, cmd }'
+}
+
+# stop_procs LIST - SIGTERM each pid in LIST (pid<TAB>cmd lines), wait up to 5 s; never SIGKILL.
+stop_procs() {
+  local pid cmd i alive
+  while IFS=$'\t' read -r pid cmd; do
+    [ -n "$pid" ] || continue
+    info "zatrzymuję proces $pid ($cmd)"
+    kill "$pid" 2>/dev/null
+  done <<WTEOF
+$1
+WTEOF
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    alive=""
+    while IFS=$'\t' read -r pid cmd; do
+      if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then alive="$alive $pid"; fi
+    done <<WTEOF
+$1
+WTEOF
+    [ -z "$alive" ] && return 0
+    sleep 0.5
+  done
+  die "procesy nie zatrzymały się (pid:$alive), nic nie usunięto; zakończ je ręcznie"
+}
+
 # cmd_drop - remove a worktree and its branch, only when nothing can be lost.
 # Safe flags only (no force, no -D). --merged-pr: caller asserts the PR is merged on GitHub,
 # so commits not merged locally are allowed. --check: run all checks, remove nothing.
 cmd_drop() {
-  local name="" check=0 merged_pr=0 usage="użycie: wt drop <temat> [--merged-pr] [--check]"
+  local name="" check=0 merged_pr=0 stop=0 usage="użycie: wt drop <temat> [--merged-pr] [--check] [--stop-procs]"
   while [ $# -gt 0 ]; do
     case "$1" in
       --check)     check=1 ;;
       --merged-pr) merged_pr=1 ;;
+      --stop-procs) stop=1 ;;
       -*)          die "nieznana opcja: $1" ;;
       *)
         [ -n "$name" ] && die "$usage"
@@ -915,10 +952,20 @@ cmd_drop() {
   [ -n "$name" ] || die "$usage"
   init_repo
   valid_name "$name"
-  local wpath dirty pid target ahead here upref
+  local wpath dirty pid cmd target ahead here upref procs
   wpath=$(find_worktree "$name") || die "nie ma worktree na gałęzi '$name'"
   here=$(pwd -P)
   case "$here/" in "$wpath"/*) die "stoisz w tym worktree, przejdź do innego katalogu" ;; esac
+
+  # Running processes (dev servers etc.) block the drop before any other check or action.
+  procs=$(wt_procs "$wpath")
+  if [ -n "$procs" ] && [ "$stop" != 1 ]; then
+    printf 'wt: w worktree "%s" działają procesy:\n' "$name" >&2
+    while IFS=$'\t' read -r pid cmd; do printf '  pid %s  %s\n' "$pid" "$cmd" >&2; done <<WTEOF
+$procs
+WTEOF
+    die "zatrzymaj je (albo użyj: wt drop $name --stop-procs) i spróbuj ponownie; nic nie usunięto"
+  fi
 
   dirty=$(git -C "$wpath" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
   [ "$dirty" != 0 ] && die "worktree '$name' ma niezacommitowane zmiany ($dirty), zacommituj albo odrzuć je ręcznie"
@@ -949,6 +996,7 @@ cmd_drop() {
     info "można usunąć: $name"
     return 0
   fi
+  if [ -n "$procs" ]; then stop_procs "$procs"; fi
   # Hooks get the worktree identity via env; they run from the main checkout (the worktree is going away).
   if [ -n "$CFG_WT_PRE_DROP" ]; then
     info "uruchamiam WT_PRE_DROP: $CFG_WT_PRE_DROP"

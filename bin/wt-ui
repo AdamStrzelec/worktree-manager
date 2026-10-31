@@ -1438,7 +1438,14 @@ class App:
         if not self.confirm_box(plan["title"], plan["lines"], plan["steps"]):
             self.message = "anulowano"
             return
-        fail = self.run_steps(plan["steps"], plan["title"])
+        steps = plan["steps"]
+        fail = self.run_steps(steps, plan["title"])
+        # Processes running inside the worktree block `wt drop`; offer to stop them and retry from that step.
+        if fail and "działają procesy" in fail[1]:
+            rest = steps[steps.index(fail[0]):]
+            rest = [dict(st, argv=st["argv"] + ["--stop-procs"]) if st["argv"][:2] == [WT, "drop"] else st for st in rest]
+            if self.confirm_box("Procesy w worktree", fail[1].splitlines() + ["", "Zatrzymać je (SIGTERM, nigdy kill -9) i ponowić?"], rest):
+                fail = self.run_steps(rest, plan["title"])
         self.reload()  # also re-reads PR state from GitHub (source of truth)
         if fail:
             st, text = fail
@@ -1568,7 +1575,11 @@ class App:
                     value = self.prompt("Ustaw %s (zapis do .git/wt.conf)" % it["key"], it["value"])
                     if self.cancelled:
                         continue
-                    changed |= self.config_apply(["set", it["key"], value])
+                    args = ["set", it["key"], value]
+                    if it["key"] == "WT_DIR" and value != it["value"] and self.rows and self.confirm(
+                            "Przenieść %d istniejących worktree do nowego katalogu?" % len(self.rows)):
+                        args.append("--move")
+                    changed |= self.config_apply(args)
                 elif key == ord("E"):
                     changed |= self.config_edit_file()
                 elif key == ord("d"):

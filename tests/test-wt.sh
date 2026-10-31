@@ -118,6 +118,25 @@ check "copy: brakujący plik pomijany" test ! -e .claude/worktrees/feat-copy/.br
 case "$(git -C .claude/worktrees/feat-copy status --short)" in *env.local*) bad "copy: plik widoczny w git status" ;; *) ok "copy: plik w exclude (git status czysty)" ;; esac
 rm -rf cfgdir .env.local .git/wt.conf
 
+echo "-- drop: procesy w worktree"
+$WT new pr-a --no-fetch >/dev/null 2>&1
+(cd .claude/worktrees/pr-a && exec sleep 120) &
+SLP=$!
+sleep 1
+HL2=$(mktemp -d)/hk.log
+printf 'WT_PRE_DROP=echo ran >> %s\n' "$HL2" > .git/wt.conf
+out=$($WT drop pr-a 2>&1); rc=$?
+[ "$rc" -ne 0 ] && contains "proc: drop odmawia i listuje pid" "$out" "pid $SLP" || bad "proc: drop nie odmówił"
+check "proc: worktree zostaje" test -d .claude/worktrees/pr-a
+[ ! -s "$HL2" ] && ok "proc: żadna logika (hook) się nie wykonała" || bad "proc: hook odpalony mimo procesów"
+check_fail "proc: --check też odmawia" $WT drop pr-a --check
+$WT drop pr-a --stop-procs >/dev/null 2>&1; rc=$?
+[ "$rc" -eq 0 ] && ok "proc: --stop-procs usuwa" || bad "proc: --stop-procs exit $rc"
+kill -0 "$SLP" 2>/dev/null && bad "proc: proces nadal żyje" || ok "proc: proces zatrzymany"
+wait "$SLP" 2>/dev/null
+check "proc: worktree usunięte" test ! -d .claude/worktrees/pr-a
+rm -f .git/wt.conf
+
 echo "-- drop: hooki"
 HL=$(mktemp -d)/hook.log
 $WT new hk-ok >/dev/null 2>&1
@@ -509,13 +528,13 @@ $WT config set WT_DIR "$MV/new" --move > "$MV/out" 2>&1; rc=$?; out=$(cat "$MV/o
 check "move: worktree w nowym miejscu" test -f "$MV/new/mv-a/untracked.txt"
 check "move: zagnieżdżona nazwa zachowana" test -d "$MV/new/mv/nested"
 check "move: stare miejsce puste" test ! -d .claude/worktrees/mv-a
-mvn=$(git worktree list --porcelain | grep -c "^worktree $MV/new/")
+mvn=$(git worktree list --porcelain | grep -c "^worktree $MV/new/mv")
 [ "$mvn" = 2 ] && ok "move: git zna nowe ścieżki" || bad "move: git worktree list ($mvn; $(git worktree list --porcelain | grep ^worktree | tr '\n' ' '))"
 rm -f "$MV/new/mv-a/untracked.txt"
 $WT drop mv-a > "$MV/drop" 2>&1; rc=$?
 [ "$rc" -eq 0 ] && ok "move: wt drop działa po przeniesieniu" || bad "move: drop ($(cat "$MV/drop"))"
 $WT drop mv/nested >/dev/null 2>&1
-rm -f .git/wt.conf; rm -rf "$MV"
+rm -f .git/wt.conf; rm -rf "$MV"; git worktree prune
 rm -f .git/wt.conf
 $WT drop cfg-w1 >/dev/null 2>&1
 out=$(WT_DIR=/tmp/env-wt $WT config set WT_DIR ../zz 2>&1); contains "set: ostrzeżenie, gdy env przesłania" "$out" "przesłonięte przez: env"
@@ -673,6 +692,61 @@ cfg_keys=$($WT config --porcelain | awk -F'\t' '{print $1}' | sort | tr '\n' ' '
 ui_safe=$(printf '%s\n' "$out" | sed -n 's/^SAFE://p')
 wt_safe=$(sed -n 's/^SAFE_KEYS="\(.*\)"$/\1/p' "$WT_BIN" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ' | sed 's/ $//')
 [ "$ui_safe" = "$wt_safe" ] && ok "ui: klucze dozwolone we wspólnym .wt.conf zgodne z SAFE_KEYS" || bad "ui: SAFE ($ui_safe) != SAFE_KEYS ($wt_safe)"
+
+echo "-- ui: WT_DIR z przeniesieniem (pty)"
+out=$(python3 - "$WT_BIN" <<'PY'
+import os, pty, sys, time, select, subprocess, tempfile, struct, fcntl, termios
+W = sys.argv[1]
+repo = os.path.realpath(tempfile.mkdtemp()); dest = os.path.realpath(tempfile.mkdtemp()) + "/wts"
+env = {**os.environ, "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@a", "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@a"}
+sh = lambda c: subprocess.run(c, shell=True, cwd=repo, env=env, capture_output=True, text=True)
+sh("git init -q -b main && git commit -q --allow-empty -m i"); sh("'%s' new mvx --no-fetch" % W)
+open(repo + "/.claude/worktrees/mvx/.wt-owner", "w").write('{"pid":999999}')  # dead owner
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo); os.environ["TERM"] = "xterm-256color"; os.execv(W, ["wt", "ui"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+def k(b, t=0.6):
+    os.write(fd, b); e = time.time() + t
+    while time.time() < e:
+        if select.select([fd], [], [], 0.1)[0]:
+            try: os.read(fd, 65536)
+            except OSError: return
+k(b"", 1.5); k(b"C"); k(b"\r"); k(b"\x7f" * 30 + dest.encode() + b"\r"); k(b"y", 1.5); k(b"\x1b"); k(b"q")
+print("MOVED:%s" % (os.path.isdir(dest + "/mvx") and not os.path.isdir(repo + "/.claude/worktrees/mvx")))
+PY
+)
+contains "ui: zmiana WT_DIR + y przenosi worktree" "$out" "MOVED:True"
+
+echo "-- ui: drop z procesami (pty)"
+out=$(python3 - "$WT_BIN" <<'PY'
+import os, pty, sys, time, select, subprocess, tempfile, struct, fcntl, termios
+W = sys.argv[1]
+repo = os.path.realpath(tempfile.mkdtemp())
+env = {**os.environ, "GIT_AUTHOR_NAME": "a", "GIT_AUTHOR_EMAIL": "a@a", "GIT_COMMITTER_NAME": "a", "GIT_COMMITTER_EMAIL": "a@a"}
+sh = lambda c: subprocess.run(c, shell=True, cwd=repo, env=env, capture_output=True, text=True)
+sh("git init -q -b main && git commit -q --allow-empty -m i"); sh("'%s' new prx --no-fetch" % W)
+open(repo + "/.claude/worktrees/prx/.wt-owner", "w").write('{"pid":999999}')
+subprocess.run("sleep 987 </dev/null >/dev/null 2>&1 &", shell=True, cwd=repo + "/.claude/worktrees/prx")  # orphaned like a real dev server
+time.sleep(0.5)
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo); os.environ["TERM"] = "xterm-256color"; os.execv(W, ["wt", "ui"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+def k(b, t=0.6):
+    os.write(fd, b); e = time.time() + t
+    while time.time() < e:
+        if select.select([fd], [], [], 0.1)[0]:
+            try: os.read(fd, 65536)
+            except OSError: return
+k(b"", 1.5); k(b"x", 0.8); k(b"y", 2); k(b"y", 3); k(b"q")
+time.sleep(0.5)
+left = subprocess.run(["pgrep", "-f", "sleep 987"], capture_output=True, text=True).stdout.split()
+print("GONE:%s KILLED:%s" % (not os.path.isdir(repo + "/.claude/worktrees/prx"), not left))
+for p in left: os.kill(int(p), 15)
+PY
+)
+contains "ui: drop z procesami zatrzymuje i usuwa" "$out" "GONE:True KILLED:True"
 
 echo "-- ui: edycja configu (pty)"
 out=$(python3 - "$WT_BIN" "$(cd "$(dirname "$WT_BIN")" && pwd -P)/wt-ui" <<'PY'

@@ -79,7 +79,7 @@ Tylko to, co wynika z komend. Nigdy `git add -A`, `reset --hard`, `push` ani for
 | `wt test [args]` | Wybiera komendę testową: `WT_TEST` (zaufane źródła), potem pierwsza linia `.wt-test` w korzeniu worktree, potem autodetekcja. Uruchamia ją w korzeniu bieżącego worktree (`git rev-parse --show-toplevel`) z przekazaniem argumentów. Zwraca kod wyjścia komendy. Brak komendy to kod 127 z instrukcją |
 | `wt config` | Pokazuje repo, bazę, katalog worktree oraz efektywne wartości wszystkich kluczy z informacją, skąd pochodzą. `--porcelain`: TSV `klucz, źródło, wartość, domyślna` (bez nagłówka) |
 | `wt config set KLUCZ WARTOŚĆ` / `unset KLUCZ` | Zapis i usuwanie klucza w prywatnym `.git/wt.conf` (atomowo, komentarze zachowane, walidacja wartości; ostrzega, gdy wygrywa inne źródło, np. env) |
-| `wt drop <temat> [--check] [--merged-pr]` | Usuwa worktree (`git worktree remove`, bez force) i gałąź (`branch -d`, nigdy `-D`). Odmawia przy zmianach niezacommitowanych, żywym właścicielu, commitach niezmergowanych do targetu (`wt-target`, a bez niego bazy) albo gdy stoisz w tym worktree. `--check` tylko sprawdza, `--merged-pr` oznacza, że PR jest zmergowany na GitHubie. Odpala hooki `WT_PRE_DROP` / `WT_POST_DROP` |
+| `wt drop <temat> [--check] [--merged-pr]` | Usuwa worktree (`git worktree remove`, bez force) i gałąź (`branch -d`, nigdy `-D`). Odmawia przy zmianach niezacommitowanych, żywym właścicielu, commitach niezmergowanych do targetu (`wt-target`, a bez niego bazy) albo gdy stoisz w tym worktree. Odmawia też, gdy w worktree działają procesy (wykrywane przez `lsof` po katalogu roboczym, np. `npm run dev`): wypisuje pid-y i kończy się błędem przed jakąkolwiek inną logiką, hookami i usuwaniem. `--stop-procs` wysyła im SIGTERM (czeka do 5 s, nigdy SIGKILL) i dopiero potem usuwa; jeśli się nie zatrzymają, nic nie jest usuwane. `--check` tylko sprawdza (też procesy), `--merged-pr` oznacza, że PR jest zmergowany na GitHubie. Odpala hooki `WT_PRE_DROP` / `WT_POST_DROP` |
 | `wt ui` | Interfejs w terminalu (sekcja 5) |
 | `wt` (bez argumentu) / nieznana komenda | Help na stderr (lista komend plus ścieżka repo), `exit 1` |
 
@@ -128,7 +128,7 @@ WT_POST_NEW=tmux new-session -d -s "$(basename "$PWD")" -c "$PWD"
 WT_POST_DROP=tmux kill-session -t "$WT_NAME" 2>/dev/null; true
 ```
 
-Edycja configu bez ręcznego pliku: `wt config set KLUCZ WARTOŚĆ`, `wt config unset KLUCZ` albo ekran Config w `wt ui` (`C`). Zapis idzie zawsze do prywatnego `.git/wt.conf`; wspólnego `.wt.conf` UI nie rusza. Zmiana `WT_DIR` nie przenosi istniejących worktree (`wt list` bierze je z `git worktree list`).
+Edycja configu bez ręcznego pliku: `wt config set KLUCZ WARTOŚĆ`, `wt config unset KLUCZ` albo ekran Config w `wt ui` (`C`). Zapis idzie zawsze do prywatnego `.git/wt.conf`; wspólnego `.wt.conf` UI nie rusza. Zmiana `WT_DIR` domyślnie nie przenosi istniejących worktree (`wt list` bierze je z `git worktree list`, więc nic się nie gubi). Z `wt config set WT_DIR <ścieżka> --move` (w UI: pytanie po zmianie `WT_DIR`) `wt` przenosi przez `git worktree move` wszystkie worktree leżące w starym katalogu. Przed zapisem odmawia, gdy cel już istnieje, worktree jest zajęte (żywy `.wt-owner`) albo zablokowane; worktree spoza starego katalogu zostają. Niedziałające przeniesienie jednego worktree nie cofa pozostałych, tylko je wylicza z błędem.
 
 Zmienne środowiska czytane przez skrypt: `CLAUDE_SESSION_ID`, `TMUX_PANE`, `USER`, `XDG_CONFIG_HOME`, `WT_FETCH_TIMEOUT` (sekundy, domyślnie 20, limit czasu `git fetch`).
 
