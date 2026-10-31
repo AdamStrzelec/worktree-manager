@@ -118,6 +118,30 @@ check "copy: brakujący plik pomijany" test ! -e .claude/worktrees/feat-copy/.br
 case "$(git -C .claude/worktrees/feat-copy status --short)" in *env.local*) bad "copy: plik widoczny w git status" ;; *) ok "copy: plik w exclude (git status czysty)" ;; esac
 rm -rf cfgdir .env.local .git/wt.conf
 
+echo "-- drop: hooki"
+HL=$(mktemp -d)/hook.log
+$WT new hk-ok >/dev/null 2>&1
+printf 'WT_PRE_DROP=echo pre $WT_NAME $WT_BRANCH >> %s; test -d "$WT_PATH"\nWT_POST_DROP=echo post $WT_NAME $(basename "$WT_MAIN") >> %s; test ! -d "$WT_PATH"\n' "$HL" "$HL" > .git/wt.conf
+check "hook: drop z hookami" $WT drop hk-ok
+[ "$(cat "$HL")" = "$(printf 'pre hk-ok hk-ok\npost hk-ok %s' "$(basename "$PWD")")" ] && ok "hook: kolejność i zmienne" || bad "hook: log ($(cat "$HL" 2>&1))"
+$WT new hk-veto >/dev/null 2>&1
+printf 'WT_PRE_DROP=exit 1\nWT_POST_DROP=echo post >> %s\n' "$HL" > .git/wt.conf
+: > "$HL"
+check_fail "hook: PRE wetuje drop" $WT drop hk-veto
+check "hook: worktree zostaje po wecie" test -d .claude/worktrees/hk-veto
+[ ! -s "$HL" ] && ok "hook: POST nie odpala po wecie" || bad "hook: POST po wecie"
+printf 'WT_POST_DROP=exit 5\n' > .git/wt.conf
+check "hook: błąd POST nie przerywa" $WT drop hk-veto
+check "hook: worktree usunięte mimo błędu POST" test ! -d .claude/worktrees/hk-veto
+$WT new hk-chk >/dev/null 2>&1
+printf 'WT_PRE_DROP=echo x >> %s\n' "$HL" > .git/wt.conf
+: > "$HL"; $WT drop hk-chk --check >/dev/null 2>&1
+[ ! -s "$HL" ] && ok "hook: --check nie odpala hooków" || bad "hook: --check odpalił hook"
+$WT drop hk-chk >/dev/null 2>&1
+printf 'WT_PRE_DROP=evil\n' > .wt.conf; rm .git/wt.conf
+case "$($WT config --porcelain 2>/dev/null | grep '^WT_PRE_DROP')" in *evil*) bad "hook: PRE z .wt.conf" ;; *) ok "hook: PRE z .wt.conf zignorowany" ;; esac
+rm -f .wt.conf
+
 echo "-- list"
 out=$($WT list 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "list exit 0" || bad "list exit $rc"
@@ -404,9 +428,9 @@ check_fail "sama flaga bez nazwy" $WT new --no-fetch
 
 # wt config --porcelain: key<TAB>source<TAB>value<TAB>default, one row per key, order of ALL_KEYS
 out=$($WT config --porcelain 2>&1)
-[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 7 ] && ok "config --porcelain: 7 wierszy" || bad "config --porcelain: liczba wierszy ($out)"
+[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 9 ] && ok "config --porcelain: 9 wierszy" || bad "config --porcelain: liczba wierszy ($out)"
 [ "$(printf '%s\n' "$out" | head -n1 | awk -F'\t' '{print NF}')" = 4 ] && ok "config --porcelain: 4 pola" || bad "config --porcelain: liczba pól"
-[ "$(printf '%s\n' "$out" | awk -F'\t' '{print $1}' | tr '\n' ' ')" = "WT_DIR WT_BASE WT_LINK WT_COPY WT_FETCH WT_TEST WT_POST_NEW " ] && ok "config --porcelain: kolejność kluczy" || bad "config --porcelain: kolejność kluczy"
+[ "$(printf '%s\n' "$out" | awk -F'\t' '{print $1}' | tr '\n' ' ')" = "WT_DIR WT_BASE WT_LINK WT_COPY WT_FETCH WT_TEST WT_POST_NEW WT_PRE_DROP WT_POST_DROP " ] && ok "config --porcelain: kolejność kluczy" || bad "config --porcelain: kolejność kluczy"
 contains "config --porcelain: domyślna WT_DIR" "$out" "$(printf 'WT_DIR\tdomyślna\t.claude/worktrees\t.claude/worktrees')"
 contains "config --porcelain: puste pole bez (puste)" "$out" "$(printf 'WT_BASE\tdomyślna\t\t')"
 printf 'WT_DIR=../x-wt\nWT_TEST=echo a\tb\n' > .git/wt.conf

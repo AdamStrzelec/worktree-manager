@@ -26,7 +26,7 @@ info() {
 # Keys a repo-tracked .wt.conf may set. Everything else needs a trusted source
 # (.git/wt.conf, global config, env) because WT_TEST / WT_POST_NEW run commands.
 SAFE_KEYS=" WT_DIR WT_BASE WT_LINK WT_COPY WT_FETCH "
-ALL_KEYS="WT_DIR WT_BASE WT_LINK WT_COPY WT_FETCH WT_TEST WT_POST_NEW"
+ALL_KEYS="WT_DIR WT_BASE WT_LINK WT_COPY WT_FETCH WT_TEST WT_POST_NEW WT_PRE_DROP WT_POST_DROP"
 
 # Seconds before a hung `git fetch` (network, auth prompt) is abandoned; env override for tests.
 FETCH_TIMEOUT=${WT_FETCH_TIMEOUT:-20}
@@ -40,10 +40,12 @@ DEFAULT_WT_COPY=""
 DEFAULT_WT_FETCH="1"
 DEFAULT_WT_TEST=""
 DEFAULT_WT_POST_NEW=""
+DEFAULT_WT_PRE_DROP=""
+DEFAULT_WT_POST_DROP=""
 
 # Effective values and their origin, filled by load_config.
-CFG_WT_DIR="" CFG_WT_BASE="" CFG_WT_LINK="" CFG_WT_COPY="" CFG_WT_FETCH="" CFG_WT_TEST="" CFG_WT_POST_NEW=""
-SRC_WT_DIR="" SRC_WT_BASE="" SRC_WT_LINK="" SRC_WT_COPY="" SRC_WT_FETCH="" SRC_WT_TEST="" SRC_WT_POST_NEW=""
+CFG_WT_DIR="" CFG_WT_BASE="" CFG_WT_LINK="" CFG_WT_COPY="" CFG_WT_FETCH="" CFG_WT_TEST="" CFG_WT_POST_NEW="" CFG_WT_PRE_DROP="" CFG_WT_POST_DROP=""
+SRC_WT_DIR="" SRC_WT_BASE="" SRC_WT_LINK="" SRC_WT_COPY="" SRC_WT_FETCH="" SRC_WT_TEST="" SRC_WT_POST_NEW="" SRC_WT_PRE_DROP="" SRC_WT_POST_DROP=""
 
 # set_cfg KEY VALUE SOURCE - assign without eval (value stays plain text).
 set_cfg() {
@@ -55,6 +57,8 @@ set_cfg() {
     WT_FETCH)    CFG_WT_FETCH=$2;    SRC_WT_FETCH=$3 ;;
     WT_TEST)     CFG_WT_TEST=$2;     SRC_WT_TEST=$3 ;;
     WT_POST_NEW) CFG_WT_POST_NEW=$2; SRC_WT_POST_NEW=$3 ;;
+    WT_PRE_DROP) CFG_WT_PRE_DROP=$2; SRC_WT_PRE_DROP=$3 ;;
+    WT_POST_DROP) CFG_WT_POST_DROP=$2; SRC_WT_POST_DROP=$3 ;;
   esac
 }
 
@@ -876,7 +880,18 @@ cmd_drop() {
     info "można usunąć: $name"
     return 0
   fi
+  # Hooks get the worktree identity via env; they run from the main checkout (the worktree is going away).
+  if [ -n "$CFG_WT_PRE_DROP" ]; then
+    info "uruchamiam WT_PRE_DROP: $CFG_WT_PRE_DROP"
+    (cd "$MAIN" && WT_NAME=$name WT_PATH=$wpath WT_BRANCH=$name WT_MAIN=$MAIN bash -c "$CFG_WT_PRE_DROP") \
+      || die "WT_PRE_DROP zakończyło się błędem, nic nie usunięto"
+  fi
   git -C "$MAIN" worktree remove "$wpath" || die "git worktree remove nie powiodło się"
+  if [ -n "$CFG_WT_POST_DROP" ]; then
+    info "uruchamiam WT_POST_DROP: $CFG_WT_POST_DROP"
+    (cd "$MAIN" && WT_NAME=$name WT_PATH=$wpath WT_BRANCH=$name WT_MAIN=$MAIN bash -c "$CFG_WT_POST_DROP") \
+      || info "UWAGA: WT_POST_DROP zakończyło się błędem (nic nie cofnięto)" >&2
+  fi
   if ! git -C "$MAIN" branch -d "$name" >/dev/null; then
     die "worktree usunięty, ale gałąź '$name' nie jest zmergowana lokalnie; sprawdź ją i usuń ręcznie"
   fi
