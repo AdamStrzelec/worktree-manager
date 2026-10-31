@@ -364,15 +364,82 @@ cfg_other_worktrees() {
   printf '%s' $((n - 1))
 }
 
-# cfg_set_cmd KEY VALUE - wt config set: write to the private .git/wt.conf only.
+# cfg_movable OLD_ROOT - paths of linked worktrees that live directly under OLD_ROOT.
+cfg_movable() {
+  local line wpath="" first=1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "worktree "*) wpath=${line#worktree } ;;
+      "")
+        if [ -n "$wpath" ]; then
+          if [ "$first" = 1 ]; then first=0; else
+            case "$wpath/" in "$1"/*) printf '%s\n' "$wpath" ;; esac
+          fi
+        fi
+        wpath="" ;;
+    esac
+  done < <(git -C "$MAIN" worktree list --porcelain; echo)
+}
+
+# cfg_move_check OLD NEW - refuse (before anything is written) when a move could hurt a worktree.
+cfg_move_check() {
+  local old=$1 new=$2 wpath rel pid
+  while IFS= read -r wpath; do
+    [ -n "$wpath" ] || continue
+    rel=${wpath#"$old"/}
+    [ ! -e "$new/$rel" ] || die "--move: cel już istnieje: $new/$rel"
+    if [ -f "$wpath/.wt-owner" ]; then
+      pid=$(owner_field "$wpath/.wt-owner" pid)
+      if [ -n "$pid" ] && [ "$pid" != "$PPID" ] && kill -0 "$pid" 2>/dev/null; then
+        die "--move: worktree '$rel' jest zajęty (pid $pid), zakończ tę sesję"
+      fi
+    fi
+    case "$(git -C "$MAIN" worktree list --porcelain | grep -A5 -F "worktree $wpath" | grep -c '^locked')" in
+      0) ;; *) die "--move: worktree '$rel' jest zablokowany (git worktree lock)" ;;
+    esac
+  done < <(cfg_movable "$old")
+}
+
+# cfg_move_all OLD NEW - git worktree move for every movable worktree; keeps going, reports failures.
+cfg_move_all() {
+  local old=$1 new=$2 wpath rel moved=0 failed=0
+  while IFS= read -r wpath; do
+    [ -n "$wpath" ] || continue
+    rel=${wpath#"$old"/}
+    mkdir -p "$(dirname "$new/$rel")"
+    if git -C "$MAIN" worktree move "$wpath" "$new/$rel" 2>/dev/null; then
+      info "przeniesiono: $rel"
+      moved=$((moved + 1))
+    else
+      info "UWAGA: nie udało się przenieść: $rel (zostaje w $wpath)" >&2
+      failed=$((failed + 1))
+    fi
+  done < <(cfg_movable "$old")
+  rmdir "$old" 2>/dev/null
+  case "$new" in "$MAIN"/*) add_exclude "${new#"$MAIN"}/" ;; esac
+  info "przeniesiono $moved worktree, błędów: $failed"
+  [ "$failed" -eq 0 ]
+}
+
+# cfg_set_cmd KEY VALUE [--move] - wt config set: write to the private .git/wt.conf only.
+# --move (WT_DIR only): also move existing worktrees from the old directory to the new one.
 cfg_set_cmd() {
-  [ $# -eq 2 ] || die "użycie: wt config set KLUCZ WARTOSC (pustą wartość podaj jako \"\")"
-  local key=$1 val=$2 eff src old_root="" others
+  local move=0
+  if [ $# -eq 3 ] && [ "$3" = "--move" ]; then move=1; set -- "$1" "$2"; fi
+  [ $# -eq 2 ] || die "użycie: wt config set KLUCZ WARTOSC [--move] (pustą wartość podaj jako \"\"; --move tylko dla WT_DIR)"
+  local key=$1 val=$2 eff src old_root="" others new_root=""
   cfg_known_key "$key"
+  [ "$move" = 0 ] || [ "$key" = WT_DIR ] || die "--move działa tylko z WT_DIR"
   repo_main
   load_config
   cfg_validate "$key" "$val"
-  if [ "$key" = WT_DIR ]; then resolve_wt_root; old_root=$WT_ROOT; fi
+  if [ "$key" = WT_DIR ]; then
+    resolve_wt_root; old_root=$WT_ROOT
+    if [ "$move" = 1 ]; then
+      new_root=$(wt_dir_abs "$val")
+      [ "$new_root" != "$old_root" ] && cfg_move_check "$old_root" "$new_root"
+    fi
+  fi
   cfg_rewrite set "$key" "$key=$(cfg_quote "$val")"
   if [ "$CFG_CHANGED" = 1 ]; then
     info "ustawiono $key w .git/wt.conf"
@@ -388,8 +455,10 @@ cfg_set_cmd() {
   if [ "$key" = WT_DIR ] && [ "$CFG_CHANGED" = 1 ]; then
     resolve_wt_root
     others=$(cfg_other_worktrees)
-    if [ "$WT_ROOT" != "$old_root" ] && [ "$others" -gt 0 ]; then
-      info "uwaga: istniejące worktree ($others) zostają w starym miejscu ($old_root); nowe powstaną w $WT_ROOT" >&2
+    if [ "$move" = 1 ] && [ "$WT_ROOT" != "$old_root" ]; then
+      cfg_move_all "$old_root" "$WT_ROOT" || return 1
+    elif [ "$WT_ROOT" != "$old_root" ] && [ "$others" -gt 0 ]; then
+      info "uwaga: istniejące worktree ($others) zostają w starym miejscu ($old_root); nowe powstaną w $WT_ROOT (przenieść: wt config set WT_DIR <ścieżka> --move)" >&2
     fi
   fi
 }

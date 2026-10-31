@@ -494,6 +494,29 @@ check_fail "set: WT_DIR wewnątrz istniejącego worktree" $WT config set WT_DIR 
 out=$($WT config set WT_DIR ../cfg-moved 2>&1); contains "set WT_DIR: ostrzeżenie o starych worktree" "$out" "zostają w starym miejscu"
 [ -d .claude/worktrees/cfg-w1 ] && ok "set WT_DIR: istniejące worktree nietknięte" || bad "set WT_DIR: ruszył worktree"
 rm -f .git/wt.conf
+echo "-- set WT_DIR --move"
+MV=$(cd "$(mktemp -d)" && pwd -P)
+$WT drop cfg-w1 >/dev/null 2>&1
+$WT new mv-a --no-fetch >/dev/null 2>&1
+$WT new mv/nested --no-fetch >/dev/null 2>&1
+printf 'dirty\n' > .claude/worktrees/mv-a/untracked.txt
+mkdir -p "$MV/taken/mv-a"
+check_fail "move: cel istnieje = odmowa" $WT config set WT_DIR "$MV/taken" --move
+[ ! -f .git/wt.conf ] && ok "move: odmowa nie zapisała configu" || bad "move: config zapisany mimo odmowy"
+check_fail "move: --move tylko dla WT_DIR" $WT config set WT_FETCH 0 --move
+$WT config set WT_DIR "$MV/new" --move > "$MV/out" 2>&1; rc=$?; out=$(cat "$MV/out")
+[ "$rc" -eq 0 ] && ok "move: exit 0" || bad "move: exit $rc ($out)"
+check "move: worktree w nowym miejscu" test -f "$MV/new/mv-a/untracked.txt"
+check "move: zagnieżdżona nazwa zachowana" test -d "$MV/new/mv/nested"
+check "move: stare miejsce puste" test ! -d .claude/worktrees/mv-a
+mvn=$(git worktree list --porcelain | grep -c "^worktree $MV/new/")
+[ "$mvn" = 2 ] && ok "move: git zna nowe ścieżki" || bad "move: git worktree list ($mvn; $(git worktree list --porcelain | grep ^worktree | tr '\n' ' '))"
+rm -f "$MV/new/mv-a/untracked.txt"
+$WT drop mv-a > "$MV/drop" 2>&1; rc=$?
+[ "$rc" -eq 0 ] && ok "move: wt drop działa po przeniesieniu" || bad "move: drop ($(cat "$MV/drop"))"
+$WT drop mv/nested >/dev/null 2>&1
+rm -f .git/wt.conf; rm -rf "$MV"
+rm -f .git/wt.conf
 $WT drop cfg-w1 >/dev/null 2>&1
 out=$(WT_DIR=/tmp/env-wt $WT config set WT_DIR ../zz 2>&1); contains "set: ostrzeżenie, gdy env przesłania" "$out" "przesłonięte przez: env"
 rm -f .git/wt.conf
