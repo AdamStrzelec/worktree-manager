@@ -179,7 +179,7 @@ Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wi
 | `Space` | menu skrótów w kategoriach (Wybrane worktree, Nawigacja, Widok, Ogólne) |
 | `n` | modal nowego worktree (nazwa, target branch, tytuł) |
 | `t` | testy w sfokusowanym worktree |
-| `c` | kopiuje `cd <ścieżka>` do schowka (`pbcopy`) |
+| `c` | podmenu Kopiuj (`pbcopy`): `c` kopiuje `cd <ścieżka>`, `u` kopiuje URL PR (wyłączone, gdy brak PR), `h`/`Esc` wstecz |
 | `o` | podmenu Otwórz: `c` otwiera worktree w VS Code (`code`, a bez niego `open -a "Visual Studio Code"`), `b` otwiera PR gałęzi w przeglądarce, `t` sesja tmux (na razie wyłączone), `h`/`Esc` wstecz |
 | `p` | podmenu PR: `p` push / utwórz PR (draft), `d` draft <-> ready, `m` merge PR, `M` merge + usuń worktree, `c` zamknij PR. Niedostępne opcje są wygaszone zgodnie ze stanem PR |
 | `x` | `wt drop` (z `--merged-pr`, gdy PR zmergowany) |
