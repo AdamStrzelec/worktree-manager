@@ -442,6 +442,8 @@ class App:
         self.menu_note = ""  # why the last pressed (disabled) menu entry is unavailable
         self.pending_g = False  # first g of gg
         self.cancelled = False
+        self.overlay = None     # callable drawing a full-screen view instead of the main layout
+        self.cfg = {}
         self.meta = {}          # branch -> {"title", "target", "created"}
         self.prs = {}           # branch -> PR info (from gh), filled in the background
         self.pr_status = "off"  # off (no gh) | loading | ok | err
@@ -1135,6 +1137,11 @@ class App:
         scr = self.scr
         scr.erase()
         h, w = scr.getmaxyx()
+        if self.overlay and w >= MIN_W and h >= MIN_H:
+            self.overlay()  # e.g. the config screen: replaces the main layout, dialogs draw on top
+            if refresh:
+                scr.refresh()
+            return
         if w < MIN_W or h < MIN_H:
             self.put(h // 2, max(0, (w - 12) // 2), "okno za małe", self.c["redb"])
             self.put(h // 2 + 1, max(0, (w - 11) // 2), "q = wyjście", self.c["dim"])
@@ -1417,79 +1424,126 @@ class App:
             self.message = "! brak pbcopy"
             self.modal("Schowek niedostępny", f"Brak pbcopy. Wpisz ręcznie:\n{cmd}")
 
-    def config_screen(self):
-        """Read-only view of the effective config (`wt config --porcelain`): key, source, value."""
+    def config_load(self):
+        """Fetch the effective config: (items, error-text)."""
         rc, out, err = run([WT, "config", "--porcelain"])
         items = parse_config(out) if rc == 0 else []
-        if not items:
-            self.pending_error = ("Błąd", clean_error(err, "wt config nie powiodło się"))
-            return
+        return items, ("" if items else clean_error(err, "wt config nie powiodło się"))
+
+    def config_paint(self):
+        """Draw the config screen (also used as the backdrop of the edit prompt and error modal)."""
         scr = self.scr
-        cur = 0
-        pending_g = False
-        while True:
-            scr.erase()
-            h, w = scr.getmaxyx()
-            self.box(0, 0, h, w, title="Konfiguracja (podgląd)")
-            iw = w - 4
-            kw = max(len(i["key"]) for i in items)
-            sw = min(24, max(len(i["source"]) for i in items))
-            self.segs(1, 2, [("KLUCZ".ljust(kw + 2), "dim"), ("ŹRÓDŁO".ljust(sw + 2), "dim"), ("WARTOŚĆ", "dim")], iw)
-            for n, it in enumerate(items):
-                y = 2 + n
+        items, cur, notes = self.cfg["items"], self.cfg["cur"], self.cfg["notes"]
+        h, w = scr.getmaxyx()
+        self.box(0, 0, h, w, title="Konfiguracja")
+        iw = w - 4
+        kw = max(len(i["key"]) for i in items)
+        sw = min(24, max(len(i["source"]) for i in items))
+        self.segs(1, 2, [("KLUCZ".ljust(kw + 2), "dim"), ("ŹRÓDŁO".ljust(sw + 2), "dim"), ("WARTOŚĆ", "dim")], iw)
+        for n, it in enumerate(items):
+            y = 2 + n
+            if y >= h - 2:
+                break
+            sel = n == cur
+            st = (lambda name: "s_" + name if "s_" + name in self.c else "s_plain") if sel else (lambda name: name)
+            src_style = "yellow" if it["source"] == "env" else "dim" if it["source"] == "domyślna" else "green"
+            val_style = "dim" if (not it["value"] or it["source"] == "domyślna") else "accent"
+            if sel:
+                self.put(y, 1, " " * (w - 2), self.c["s_plain"])
+            bar = self.sym["bar"] if sel else " "
+            self.segs(y, 1, [(bar + " ", st("accentb")), (it["key"].ljust(kw + 2), st("plain")),
+                             (trunc(it["source"], sw).ljust(sw + 2), st(src_style)),
+                             (it["value"] or "(puste)", st(val_style))], w - 2)
+        it = items[cur]
+        desc, hints = config_notes(it)
+        y = 3 + len(items)
+        if y < h - 3:
+            self.put(y, 2, self.sym["sep"] * max(0, iw), self.c["border"] | curses.A_DIM)
+            y += 1
+            lines = [(l, "plain") for l in textwrap.wrap(desc, max(10, iw))]
+            lines += [("", "plain"), ("Wartość:   " + (it["value"] or "(puste)"), "plain"),
+                      ("Domyślna:  " + (it["default"] or "(puste)"), "plain"),
+                      ("Źródło:    " + it["source"], "plain"), ("", "plain")]
+            for text, style in hints:
+                lines += [(l, style) for l in textwrap.wrap(text, max(10, iw))]
+            for text, style in lines:
                 if y >= h - 2:
                     break
-                sel = n == cur
-                st = (lambda name: "s_" + name if "s_" + name in self.c else "s_plain") if sel else (lambda name: name)
-                src_style = "yellow" if it["source"] == "env" else "dim" if it["source"] == "domyślna" else "green"
-                val_style = "dim" if (not it["value"] or it["source"] == "domyślna") else "accent"
-                if sel:
-                    self.put(y, 1, " " * (w - 2), self.c["s_plain"])
-                bar = self.sym["bar"] if sel else " "
-                self.segs(y, 1, [(bar + " ", st("accentb")), (it["key"].ljust(kw + 2), st("plain")),
-                                 (trunc(it["source"], sw).ljust(sw + 2), st(src_style)),
-                                 (it["value"] or "(puste)", st(val_style))], w - 2)
-            it = items[cur]
-            desc, notes = config_notes(it)
-            y = 3 + len(items)
-            if y < h - 3:
-                self.put(y, 2, self.sym["sep"] * max(0, iw), self.c["border"] | curses.A_DIM)
+                self.put(y, 2, text, self.c[style], iw)
                 y += 1
-                lines = [(l, "plain") for l in textwrap.wrap(desc, max(10, iw))]
-                lines.append(("", "plain"))
-                lines.append(("Wartość:   " + (it["value"] or "(puste)"), "plain"))
-                lines.append(("Domyślna:  " + (it["default"] or "(puste)"), "plain"))
-                lines.append(("Źródło:    " + it["source"], "plain"))
-                lines.append(("", "plain"))
-                for text, style in notes:
-                    lines += [(l, style) for l in textwrap.wrap(text, max(10, iw))]
-                lines.append(("", "plain"))
-                lines.append(("Zmiana z terminala: wt config set %s WARTOSC | wt config unset %s" % (it["key"], it["key"]), "dim"))
-                for text, style in lines:
-                    if y >= h - 2:
-                        break
-                    self.put(y, 2, text, self.c[style], iw)
-                    y += 1
-            self.put(h - 1, 3, " j/k ruch   Esc/q wróć ", self.c["dim"], max(0, w - 6))
-            scr.refresh()
-            key = scr.getch()
-            if key in (curses.KEY_RESIZE, -1):
-                continue
-            if key == ord("g") and not pending_g:
-                pending_g = True
-                continue
-            gg = pending_g and key == ord("g")
-            pending_g = False
-            if key in (27, ord("q"), ord("h"), ord("C"), curses.KEY_BACKSPACE, 127, 8):
-                return
-            if key in (curses.KEY_DOWN, ord("j")):
-                cur = min(len(items) - 1, cur + 1)
-            elif key in (curses.KEY_UP, ord("k")):
-                cur = max(0, cur - 1)
-            elif key in (curses.KEY_HOME,) or gg:
-                cur = 0
-            elif key in (curses.KEY_END, ord("G")):
-                cur = len(items) - 1
+        # Result of the last edit sits just above the footer.
+        flat = []
+        for text, style in notes:
+            flat += [(l, style) for l in textwrap.wrap(text, max(10, iw))]
+        for n, (text, style) in enumerate(flat[-3:]):
+            self.put(h - 1 - len(flat[-3:]) + n, 2, text, self.c[style], iw)
+        self.put(h - 1, 3, " j/k ruch  Enter edytuj  d przywróć domyślną  Esc wróć ", self.c["dim"], max(0, w - 6))
+
+    def config_screen(self):
+        """Config screen: browse the effective config and edit keys through `wt config set/unset`.
+
+        Everything is written by `wt` itself, only to the private .git/wt.conf (never the shared .wt.conf).
+        """
+        items, err = self.config_load()
+        if not items:
+            self.pending_error = ("Błąd", err)
+            return
+        self.cfg = {"items": items, "cur": 0, "notes": []}
+        self.overlay = self.config_paint
+        changed = False
+        pending_g = False
+        try:
+            while True:
+                self.draw()
+                key = self.scr.getch()
+                if key in (curses.KEY_RESIZE, -1):
+                    continue
+                if key == ord("g") and not pending_g:
+                    pending_g = True
+                    continue
+                gg = pending_g and key == ord("g")
+                pending_g = False
+                cfg = self.cfg
+                it = cfg["items"][cfg["cur"]]
+                if key in (27, ord("q"), ord("h"), ord("C"), curses.KEY_BACKSPACE, 127, 8):
+                    break
+                if key in (curses.KEY_DOWN, ord("j")):
+                    cfg["cur"] = min(len(cfg["items"]) - 1, cfg["cur"] + 1)
+                elif key in (curses.KEY_UP, ord("k")):
+                    cfg["cur"] = max(0, cfg["cur"] - 1)
+                elif key == curses.KEY_HOME or gg:
+                    cfg["cur"] = 0
+                elif key in (curses.KEY_END, ord("G")):
+                    cfg["cur"] = len(cfg["items"]) - 1
+                elif key in (10, 13, curses.KEY_ENTER):
+                    value = self.prompt("Ustaw %s (zapis do .git/wt.conf)" % it["key"], it["value"])
+                    if self.cancelled:
+                        continue
+                    changed |= self.config_apply(["set", it["key"], value])
+                elif key == ord("d"):
+                    if self.confirm("Usunąć %s z .git/wt.conf (wróci wartość z niższego źródła)?" % it["key"]):
+                        changed |= self.config_apply(["unset", it["key"]])
+        finally:
+            self.overlay = None
+        if changed:
+            self.reload()
+            self.message = "+ zapisano konfigurację"
+
+    def config_apply(self, args):
+        """Run `wt config set|unset ...`; show errors in the red modal, results in the screen footer."""
+        rc, out, err = run([WT, "config"] + args)
+        if rc != 0:
+            self.modal("Błąd", clean_error(err, "wt config nie powiodło się"))
+            return False
+        notes = [(l, "green") for l in clean_error(out, "").splitlines()]
+        notes += [(l, "yellow") for l in clean_error(err, "").splitlines()]
+        items, _ = self.config_load()
+        keep = self.cfg["cur"]
+        if items:
+            self.cfg["items"] = items
+        self.cfg["cur"] = min(keep, len(self.cfg["items"]) - 1)
+        self.cfg["notes"] = notes
+        return True
 
     def loop(self):
         try:

@@ -610,6 +610,49 @@ ui_safe=$(printf '%s\n' "$out" | sed -n 's/^SAFE://p')
 wt_safe=$(sed -n 's/^SAFE_KEYS="\(.*\)"$/\1/p' "$WT_BIN" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ' | sed 's/ $//')
 [ "$ui_safe" = "$wt_safe" ] && ok "ui: klucze dozwolone we wspólnym .wt.conf zgodne z SAFE_KEYS" || bad "ui: SAFE ($ui_safe) != SAFE_KEYS ($wt_safe)"
 
+echo "-- ui: edycja configu (pty)"
+out=$(python3 - "$WT_BIN" "$(cd "$(dirname "$WT_BIN")" && pwd -P)/wt-ui" <<'PY'
+import os, pty, sys, time, select, subprocess, tempfile, re, struct, fcntl, termios, shutil
+wt, ui = sys.argv[1], sys.argv[2]
+repo = tempfile.mkdtemp()
+def sh(*a): subprocess.run(a, check=True, capture_output=True, cwd=repo)
+sh("git", "init", "-q", "-b", "main"); sh("git", "config", "user.email", "a@b"); sh("git", "config", "user.name", "a")
+sh("git", "commit", "-q", "--allow-empty", "-m", "i")
+conf = repo + "/.git/wt.conf"
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(repo)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("WT_")}
+    env.update(TERM="xterm-256color", LANG="en_US.UTF-8", LC_ALL="en_US.UTF-8", WT_CMD=wt)
+    os.execve(sys.executable, [sys.executable, ui], env)
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 30, 120, 0, 0))
+buf = b""
+def pump(t):
+    global buf
+    end = time.time() + t
+    while time.time() < end:
+        if select.select([fd], [], [], 0.1)[0]:
+            try: buf += os.read(fd, 65536)
+            except OSError: return
+def txt(): return re.sub(rb"\x1b\[[0-9;?]*[A-Za-z]|\x1b[()][0-9A-B]|\x1b[=>]", b"", buf).decode("utf8", "replace")
+def rd(): return open(conf).read() if os.path.exists(conf) else ""
+def key(b, t=0.8): os.write(fd, b); pump(t)
+res = []
+pump(1.5)
+key(b"C"); key(b"jjj", 0.3)                                  # WT_FETCH
+key(b"\r"); key(b"\x7f0\r", 1.2); res.append(("set", rd() == "WT_FETCH=0\n"))
+key(b"\r"); buf = b""; key(b"\x7f2\r", 1.2)
+res.append(("error-modal", "przyjmuje 0 albo 1" in txt() and rd() == "WT_FETCH=0\n"))
+key(b"\r", 0.5)                                             # dismiss the modal
+key(b"d", 0.5); key(b"n", 0.5); res.append(("unset-declined", rd() == "WT_FETCH=0\n"))
+key(b"d", 0.5); key(b"y", 1.2); res.append(("unset", rd() == ""))
+key(b"\x1b", 1.0); key(b"q", 0.5)
+shutil.rmtree(repo, ignore_errors=True)
+print(" ".join("%s=%s" % (n, "ok" if v else "FAIL") for n, v in res))
+PY
+)
+case "$out" in *FAIL*|"") bad "ui: edycja configu ($out)" ;; *) ok "ui: edycja configu (set, błąd, odmowa, unset): $out" ;; esac
+
 echo "-- ui: smoke w pty z fałszywym gh"
 SB=$(mktemp -d); mkdir -p "$SB/bin"
 cat > "$SB/bin/gh" <<'GH'
