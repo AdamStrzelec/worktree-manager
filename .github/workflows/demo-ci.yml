@@ -1,0 +1,36 @@
+# Demo CI for exercising the wt UI: three ~30 s jobs, outcome steered by branch name / PR title.
+name: demo-ci
+
+on:
+  pull_request:
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Lint (always passes)
+        run: sleep 30
+
+  unit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Unit tests (fail when branch name contains "fail")
+        env:
+          BRANCH: ${{ github.head_ref }}
+        run: |
+          sleep 30
+          case "$BRANCH" in
+            *fail*) echo "branch '$BRANCH' contains 'fail'"; exit 1 ;;
+          esac
+
+  e2e:
+    runs-on: ubuntu-latest
+    steps:
+      - name: E2E tests (fail when PR title contains "[flaky]")
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          sleep 30
+          case "$TITLE" in
+            *"[flaky]"*) echo "PR title contains [flaky]"; exit 1 ;;
+          esac

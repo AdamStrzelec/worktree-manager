@@ -493,8 +493,26 @@ assert plan("drop")["steps"][0]["argv"] == ["WT", "drop", "feat-a"]
 assert plan("drop", pr(state="MERGED"))["steps"][0]["argv"] == ["WT", "drop", "feat-a", "--merged-pr"]
 assert plan("drop", status="err", gh=False)["steps"]
 assert m.display_cmd(["WT", "drop", "a b"], "WT") == "wt drop 'a b'"
-assert set(m.ACTION_KEYS.values()) == {"push", "ready", "merge", "drop", "mergedrop"}
+assert plan("close", pr())["steps"][0]["argv"] == ["gh", "pr", "close", "7"]
+assert "error" in plan("close") and "error" in plan("close", pr(state="MERGED")) and "error" in plan("close", pr(), gh=False)
+assert set(m.ACTION_KEYS.values()) | set(m.PR_KEYS.values()) == {"push", "ready", "merge", "close", "drop", "mergedrop"}
 assert not {ord(c) for c in "ntcrqgGjk/ "} & set(m.ACTION_KEYS)
+assert not {ord(c) for c in "qgGjkhr/ "} & set(m.PR_KEYS)
+assert [h for h, _ in m.MENU][0] == "Wybrane worktree" and any(k == "p" for k, _ in m.PR_MENU)
+assert any("close" in d for _, d in m.PR_MENU) and any(k == "h/Esc" for k, _ in m.PR_MENU)
+def st(p=None, status="ok", gh=True, dirty="0"):
+    return m.pr_menu_state({"branch": "feat-a", "path": "/r", "dirty": dirty}, p, status, gh)
+dis = lambda x: sorted(k for k, v in x.items() if v)
+assert dis(st()) == ["M", "c", "d", "m"] and st()["p"] is None                  # no PR: only push
+assert dis(st(pr(draft=True))) == ["M", "m"] and "ready" in st(pr(draft=True))["m"][0]  # draft: no merge
+c = st(pr(mergeable="CONFLICTING")); assert dis(c) == ["M", "m"] and "konflikty" in c["m"][0] and "konflikty" in c["m"][1]
+assert dis(st(pr(ci="red"))) == ["M", "m"] and dis(st(pr(mergeable="UNKNOWN"))) == ["M", "m"]
+assert dis(st(pr())) == [] and dis(st(pr(ci="yellow"))) == []                  # healthy PR: all enabled
+assert dis(st(pr(), dirty="3")) == ["M"]                                         # dirty worktree: no merge+drop
+assert dis(st(pr(state="MERGED"))) == ["M", "c", "d", "m"] and dis(st(pr(state="CLOSED"))) == ["M", "c", "d", "m"]
+assert dis(st(pr(), status="loading")) == ["M", "c", "d", "m", "p"] and dis(st(pr(), status="err")) == ["M", "c", "d", "m", "p"]
+assert dis(st(gh=False, status="off")) == ["M", "c", "d", "m"]
+assert m.parse_updown("2\t3\n") == (2, 3) and m.parse_updown("") is None and m.parse_updown("x y") is None
 print("AKCJE-OK")
 PY
 )
@@ -548,6 +566,7 @@ def until(cond, to=10):
     return False
 def count(s): return log().count(s)
 def act(key, confirm=True):
+    send(" "); pump(0.3); send("p"); pump(0.3)  # Space menu -> PR submenu
     send(key); pump(0.6)
     if confirm: send("y")
 res = []
