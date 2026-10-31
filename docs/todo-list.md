@@ -48,3 +48,13 @@ Integracja z Task TUI (nasze narzedzie utworzone na zdalnym userze ssh do zarzad
 [ ] - automatyczne tworzenie nowego worktree u mnie w lokalnym repo kiedy to task dostanie odpowiedni status - DO SPRAWDZENIA
 [ ] - automatyczne usuwanie worktree u mnie lokalnie kiedy tam status taska zostanie np. zmieniony na CLOSED - TEZ DO SPRAWDZENIA
 I INNE RZECZY KTORE TRZEBA BEDZIE SPRAWDZIC PO DRODZE, A JESZCZE NAWET O NICH NIE POMYSLALEM
+
+Dla kazdego nowoutworzonego worktree
+[ ] - w configu wt dodac mozliwosc dodania promptow (opcjonalnych) ktore beda odpowiednio instruowac Claude'a w kontekscie worktree np. jak tworzyc opisy dla PR itd.
+[ ] - dodac jakis prompt lub inne narzedzie, ktore bedzie tworzylo nowe issues w repo w przypadku gdy napotka jakies bledy, ktore trzeba naprawic i/lub przetestowac
+
+Komenda wt poza repo
+[ ] - wpisanie samej komendy wt ma nam wyswietlic ui zamiast help, a help ma nam sie wyswietlic po wpisaniu flagi -h lub --help - DO SPRAWDZENIA
+[ ] - po wpisaniu wt poza repo ma byc mozliwosc wyswietlenia projektow wt dla juz utworzonych repozytoriow - DO SPRAWDZENIA
+
+Na samej gorze jak masz "wt | worktree: N | baza: main" dodaj troszke wieksze paddingi u gory i u dolu + dodaj info o tym wstecz lub w przod wzgledem origin i info o niezacommitowanych plikach

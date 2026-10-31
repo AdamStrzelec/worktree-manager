@@ -80,6 +80,28 @@ def parse_base(text):
     return ""
 
 
+def parse_updown(text):
+    """Parse `git rev-list --left-right --count @{upstream}...HEAD` into (behind, ahead); None if unparsable."""
+    parts = text.split()
+    if len(parts) == 2 and all(x.isdigit() for x in parts):
+        return int(parts[0]), int(parts[1])
+    return None
+
+
+def load_main_info():
+    """State of the main checkout: path, branch, (behind, ahead) of its upstream, changed files (git status --short)."""
+    rc, out, _ = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"])
+    if rc != 0 or not out.strip():
+        return None
+    path = os.path.dirname(out.strip().rstrip("/"))
+    _, br, _ = run(["git", "-C", path, "rev-parse", "--abbrev-ref", "HEAD"])
+    rc, ud, _ = run(["git", "-C", path, "rev-list", "--left-right", "--count", "@{upstream}...HEAD"])
+    _, up, _ = run(["git", "-C", path, "rev-parse", "--abbrev-ref", "@{upstream}"])
+    _, st, _ = run(["git", "-C", path, "status", "--short"])
+    return {"path": path, "branch": br.strip(), "updown": parse_updown(ud) if rc == 0 else None,
+            "upstream": up.strip(), "changed": st.splitlines()}
+
+
 def parse_branch_config(text, key):
     """Parse `git config --get-regexp` output for branch.<name>.<key> into {branch: value}."""
     out = {}
@@ -183,13 +205,19 @@ def parse_prs(text):
 PR_FIELDS = "number,headRefName,baseRefName,isDraft,state,mergeable,statusCheckRollup,url"
 
 
-# Help panel content: (key, description), rendered like the Yazi key hints.
-HELP = [("j/k ↑/↓", "ruch"), ("g/G", "góra / dół"), ("PgUp/PgDn", "strona"),
-        ("n", "nowy worktree"), ("t", "testy w worktree"), ("c", "kopiuj cd"),
-        ("p", "push / utwórz PR (draft)"), ("d", "draft <-> ready"), ("m", "merge PR"),
-        ("x", "usuń worktree"), ("M", "merge PR + usuń"),
-        ("r", "odśwież"), ("/", "filtr"), ("Esc", "wyczyść filtr / wyjście"),
-        ("Space", "zamknij skróty"), ("q", "wyjście")]
+# Space menu: categories rendered as columns, (key, description) per entry. A description ending
+# in the arrow glyph opens a submenu. PR_MENU is the submenu opened with "p".
+MENU = [
+    ("Wybrane worktree", [("t", "testy"), ("c", "kopiuj cd"), ("p", "opcje PR >"), ("x", "usuń worktree")]),
+    ("Nawigacja", [("j/k ↑/↓", "ruch (k na górze = nagłówek)"), ("gg/G", "góra / dół"), ("PgUp/PgDn", "strona")]),
+    ("Widok", [("/", "filtr"), ("r", "odśwież"), ("Esc", "wyczyść filtr")]),
+    ("Ogólne", [("n", "nowy worktree"), ("Space", "zamknij menu"), ("q", "wyjście")]),
+]
+PR_MENU = [
+    ("p", "push / utwórz PR (draft)"), ("d", "draft <-> ready"), ("m", "merge PR"),
+    ("M", "merge PR + usuń worktree i gałąź lokalną"), ("c", "zamknij PR (close)"),
+    ("h/Esc", "wstecz"),
+]
 
 def display_cmd(argv, wt=None):
     """Shell-quoted command for the confirmation modal; the wt script path is shown as plain 'wt'."""
@@ -204,9 +232,9 @@ def merge_block(pr):
     if pr["state"] != "OPEN":
         return "PR #%d nie jest otwarty (%s)." % (pr["number"], pr["state"].lower() or "?"), None
     if pr["draft"]:
-        return "PR #%d jest draftem. Najpierw oznacz go jako ready (d)." % pr["number"], None
+        return "PR #%d jest draftem. Najpierw oznacz go jako ready (Space, p, d)." % pr["number"], None
     if pr["mergeable"] == "CONFLICTING":
-        return "PR #%d ma konflikty z targetem. Rozwiąż je i spróbuj ponownie." % pr["number"], None
+        return "PR #%d ma konflikty z targetem. Najpierw rozwiąż konflikty (rebase/merge targetu w worktree), potem spróbuj ponownie." % pr["number"], None
     if pr["mergeable"] != "MERGEABLE":
         return "GitHub jeszcze liczy, czy PR da się zmergować. Spróbuj za chwilę (r = odśwież).", None
     if pr["ci"] == "red":
@@ -219,7 +247,7 @@ def merge_block(pr):
 def plan_action(kind, row, meta, pr, base, pr_status, has_gh, wt="wt"):
     """Plan a single-worktree action. Pure: returns {"error": str} or {"title", "lines", "steps"}.
 
-    kind: push | ready | merge | drop | mergedrop. Each step is {"argv", "cwd"}.
+    kind: push | ready | merge | close | drop | mergedrop. Each step is {"argv", "cwd"}.
     Never forces anything; push and gh live only here, behind an explicit confirmation.
     """
     branch, path = row["branch"], row["path"]
@@ -234,7 +262,7 @@ def plan_action(kind, row, meta, pr, base, pr_status, has_gh, wt="wt"):
                  "(chyba że PR jest zmergowany) albo żywym właścicielu."]
         return {"title": "Usuń worktree", "lines": lines, "steps": steps}
 
-    gh_kinds = ("ready", "merge", "mergedrop")
+    gh_kinds = ("ready", "merge", "close", "mergedrop")
     if kind in gh_kinds or kind == "push":
         if kind in gh_kinds and not has_gh:
             return {"error": "Brak programu 'gh' w PATH. Zainstaluj GitHub CLI i zaloguj się (gh auth login)."}
@@ -259,7 +287,7 @@ def plan_action(kind, row, meta, pr, base, pr_status, has_gh, wt="wt"):
         return {"title": "Push / PR", "lines": lines, "steps": steps}
 
     if not pr:
-        return {"error": "Ta gałąź nie ma PR. Utwórz go klawiszem p."}
+        return {"error": "Ta gałąź nie ma PR. Utwórz go: Space, p, p."}
     num = str(pr["number"])
     if kind == "ready":
         if pr["state"] != "OPEN":
@@ -268,6 +296,12 @@ def plan_action(kind, row, meta, pr, base, pr_status, has_gh, wt="wt"):
         what = "ready (do przeglądu)" if pr["draft"] else "draft"
         return {"title": "Status PR", "lines": ["Zmieni PR #%s na %s." % (num, what)],
                 "steps": [{"argv": argv, "cwd": path}]}
+
+    if kind == "close":
+        if pr["state"] != "OPEN":
+            return {"error": "PR #%s nie jest otwarty (%s)." % (num, pr["state"].lower() or "?")}
+        return {"title": "Zamknij PR", "lines": ["Zamknie PR #%s bez mergowania (gałąź i worktree zostają)." % num],
+                "steps": [{"argv": ["gh", "pr", "close", num], "cwd": path}]}
 
     refusal, warning = merge_block(pr)
     if refusal:
@@ -287,9 +321,59 @@ def plan_action(kind, row, meta, pr, base, pr_status, has_gh, wt="wt"):
     return {"title": "Merge PR + usuń" if kind == "mergedrop" else "Merge PR", "lines": lines, "steps": steps}
 
 
-# key -> action kind (see plan_action)
-ACTION_KEYS = {ord("p"): "push", ord("d"): "ready", ord("m"): "merge", ord("x"): "drop", ord("M"): "mergedrop"}
+def pr_menu_state(row, pr, pr_status, has_gh):
+    """Availability of the PR submenu keys: {key: None | (short, full)}; None = enabled.
 
+    Pure. Mirrors plan_action's refusals so a disabled entry never opens a confirmation just to fail.
+    """
+    keys = ("p", "d", "m", "M", "c")
+    if has_gh and pr_status != "ok":
+        short = "PR się wczytują" if pr_status == "loading" else "brak połączenia z GitHub"
+        full = ("PR jeszcze się wczytują, spróbuj za chwilę." if pr_status == "loading" else
+                "Nie udało się pobrać PR z GitHuba (offline, brak origin albo brak logowania: gh auth login).")
+        return {k: (short, full) for k in keys}
+    st = {"p": None}  # push is always possible (creates a draft PR when none is open)
+    if not has_gh:
+        for k in keys[1:]:
+            st[k] = ("brak gh", "Brak programu 'gh' w PATH. Zainstaluj GitHub CLI i zaloguj się (gh auth login).")
+        return st
+    if not pr:
+        for k in keys[1:]:
+            st[k] = ("brak PR", "Ta gałąź nie ma PR. Najpierw utwórz go (p).")
+        return st
+    if pr["state"] != "OPEN":
+        what = (pr["state"] or "?").lower()
+        for k in keys[1:]:
+            st[k] = ("PR " + what, "PR #%d nie jest otwarty (%s)." % (pr["number"], what))
+        return st
+    st["d"] = st["c"] = None
+    refusal, _ = merge_block(pr)
+    if refusal:
+        if pr["draft"]:
+            short = "najpierw ready (d)"
+        elif pr["mergeable"] == "CONFLICTING":
+            short = "najpierw rozwiąż konflikty"
+        elif pr["mergeable"] != "MERGEABLE":
+            short = "GitHub liczy mergeable"
+        else:
+            short = "CI czerwone"
+        st["m"] = st["M"] = (short, refusal)
+    else:
+        st["m"] = None
+        dirty = (row.get("dirty") or "0").strip()
+        if dirty not in ("", "0", "-"):
+            st["M"] = ("zmiany niezacommitowane",
+                       "Worktree ma niezacommitowane zmiany (%s), więc nie da się go usunąć. Zacommituj je albo użyj samego merge (m)." % dirty)
+        else:
+            st["M"] = None
+    return st
+
+
+# key -> action kind (see plan_action)
+ACTION_KEYS = {ord("x"): "drop"}  # direct keys on the focused worktree
+PR_KEYS = {ord("p"): "push", ord("d"): "ready", ord("m"): "merge", ord("M"): "mergedrop", ord("c"): "close"}  # PR submenu
+
+HDR_H = 3  # header block: padding row, content row, padding row
 ITEM_H = 3  # rows per list item: branch + PR/CI, title + conflicts, age + counters
 ITEM_PITCH = ITEM_H + 1  # item rows + one separator row
 MIN_W, MIN_H = 50, 10
@@ -309,6 +393,8 @@ class App:
         self.collisions = {}
         self.base = ""
         self.cursor = 0
+        self.on_header = False  # focus on the header (main checkout) instead of the list
+        self.main = None
         self.top = 0
         self.body_h = 1
         self.filter = ""
@@ -316,6 +402,9 @@ class App:
         self.pending_error = None
         self.detail_cache = {}
         self.show_help = False
+        self.menu = "main"  # which Space menu is shown: main | pr
+        self.menu_note = ""  # why the last pressed (disabled) menu entry is unavailable
+        self.pending_g = False  # first g of gg
         self.cancelled = False
         self.meta = {}          # branch -> {"title", "target", "created"}
         self.prs = {}           # branch -> PR info (from gh), filled in the background
@@ -379,8 +468,24 @@ class App:
                         c["s_" + name] = curses.color_pair(40 + j)
                     except curses.error:
                         pass
+            try:
+                # Menu: every style on solid black so the layout underneath never shows through.
+                black = 16 if rich else curses.COLOR_BLACK
+                mshades = {"plain": (252, curses.COLOR_WHITE), "dim": (245, curses.COLOR_WHITE),
+                           "border": (111, curses.COLOR_BLUE), "accent": (117, curses.COLOR_CYAN),
+                           "green": (114, curses.COLOR_GREEN), "yellow": (222, curses.COLOR_YELLOW),
+                           "red": (211, curses.COLOR_RED)}
+                for j, (name, (fg256, fg8)) in enumerate(mshades.items()):
+                    curses.init_pair(60 + j, fg256 if rich else fg8, black)
+                    c["m_" + name] = curses.color_pair(60 + j)
+            except curses.error:
+                pass
         else:
             c["sel"] = curses.A_REVERSE
+        for name in ("plain", "dim", "border", "accent", "green", "yellow", "red"):
+            c.setdefault("m_" + name, c.get(name, 0) if name != "plain" else 0)
+        for name in ("accent", "green"):
+            c["m_" + name + "b"] = c["m_" + name] | curses.A_BOLD
         for name in ("border", "accent", "green", "yellow", "red", "mag", "title"):
             c.setdefault(name, 0)
         c["redb"] = c["red"] | curses.A_BOLD
@@ -476,6 +581,7 @@ class App:
         titles, targets = parse_branch_config(tt, "wt-title"), parse_branch_config(tg, "wt-target")
         self.meta = {r["branch"]: {"title": titles.get(r["branch"], ""), "target": targets.get(r["branch"], ""),
                                    "created": created_ts(r["path"])} for r in self.rows}
+        self.main = load_main_info()
         self.start_pr_fetch()
 
     def start_pr_fetch(self):
@@ -736,7 +842,7 @@ class App:
         for i, r in enumerate(rows[self.top:self.top + cap]):
             idx = self.top + i
             y = y0 + 1 + i * ITEM_PITCH
-            selected = idx == self.cursor
+            selected = idx == self.cursor and not self.on_header
             if i > 0 and y - 1 < y0 + ph - 1:  # thin separator between items
                 self.put(y - 1, x0 + 3, self.sym["sep"] * max(0, iw - 4), self.c["border"] | curses.A_DIM)
             if selected:
@@ -854,23 +960,140 @@ class App:
         for i, parts in enumerate(lines[:ph - 2]):
             self.segs(y0 + 1 + i, x0 + 2, parts, iw)
 
+    def header_parts(self, rows, focus):
+        """(text, style) parts of the header line; styles get the focused-row variants when focus is set."""
+        pre = "s_" if focus else ""
+        sty = lambda n: pre + n
+        parts = [(" wt ", sty("accentb")), ("│ ", sty("border")), (f"worktree: {len(rows)}", sty("plain"))]
+        if self.base:
+            parts += [("  │ ", sty("border")), ("baza: ", sty("dim")), (self.base, sty("greenb"))]
+        mi = self.main
+        if mi:
+            ud = mi["updown"]
+            if ud is None:
+                parts += [("  │ ", sty("border")), ("origin: ", sty("dim")), ("brak upstreamu", sty("dim"))]
+            elif ud == (0, 0):
+                parts += [("  │ ", sty("border")), ("origin: ", sty("dim")), (self.sym["ok"] + " zgodny", sty("green"))]
+            else:
+                parts += [("  │ ", sty("border")), ("origin: ", sty("dim")),
+                          (f"{ud[0]} w tyle", sty("yellow") if ud[0] else sty("dim")), (" · ", sty("dim")),
+                          (f"{ud[1]} do przodu", sty("accent") if ud[1] else sty("dim"))]
+            n = len(mi["changed"])
+            parts += [("  │ ", sty("border")), ("zmiany: ", sty("dim")),
+                      (f"{n} niezacommitowanych" if n else "brak", sty("yellow") if n else sty("dim"))]
+        if self.filter:
+            parts += [("  │ ", sty("border")), ("filtr: ", sty("dim")), (self.filter, sty("yellow"))]
+        return parts
+
+    def draw_header(self, rows, w):
+        """Header block with padding above and below; focusable (k at the top of the list) to show the main checkout."""
+        y = HDR_H // 2
+        if self.on_header:
+            for i in range(HDR_H):
+                self.put(i, 0, " " * (w - 1), self.c["s_plain"])
+            self.put(y, 0, self.sym["bar"], self.c["s_accentb"])
+        self.segs(y, 1, self.header_parts(rows, self.on_header), w - 2)
+
+    def draw_main_detail(self, y0, x0, ph, pw):
+        self.box(y0, x0, ph, pw, title="Szczegóły: checkout główny")
+        mi = self.main
+        if not mi:
+            self.put(y0 + 1, x0 + 2, "brak danych o głównym checkoucie", self.c["dim"], pw - 4)
+            return
+        iw = pw - 4
+        lab = lambda t: (t.ljust(15), "dim")
+        ud = mi["updown"]
+        lines = [[(mi["branch"] or "?", "greenb")],
+                 [(mi["path"] if len(mi["path"]) <= iw else "…" + mi["path"][-(iw - 1):], "dim")], [],
+                 [lab("baza wt"), (self.base or "?", "accent")]]
+        if mi["updown"] is None:
+            lines.append([lab("origin"), ("brak upstreamu dla tej gałęzi", "dim")])
+        else:
+            lines.append([lab("origin"), (mi["upstream"], "accent")])
+            lines.append([lab("w tyle"), (f"{ud[0]} commitów", "yellow" if ud[0] else "dim"),
+                          ("  (pobierz zmiany: git pull --ff-only)" if ud[0] else "", "dim")])
+            lines.append([lab("do przodu"), (f"{ud[1]} commitów", "accent" if ud[1] else "dim"),
+                          ("  (niewypchnięte)" if ud[1] else "", "dim")])
+        lines.append([lab(""), ("stan z ostatniego fetch (wt new pobiera zmiany)", "dim")])
+        changed = mi["changed"]
+        lines += [[], [("Zmiany niezacommitowane", "accentb")]]
+        room = max(1, ph - len(lines) - 3)
+        for ch in changed[:room]:
+            code = ch[:2].strip()
+            style = "red" if "D" in code else "green" if code in ("A", "??") else "yellow"
+            lines.append([("  " + ch[:2], style), (ch[2:], "plain")])
+        if not changed:
+            lines.append([("  " + self.sym["ok"] + " czysto", "green")])
+        if len(changed) > room:
+            lines.append([(f"  ... i {len(changed) - room} więcej", "dim")])
+        for i, parts in enumerate(lines[:ph - 2]):
+            self.segs(y0 + 1 + i, x0 + 2, parts, iw)
+
+    def menu_columns(self):
+        """Columns of the current menu as (header, entries): categories, or the PR submenu."""
+        if self.menu == "pr":
+            rows = self.visible()
+            row = rows[min(self.cursor, len(rows) - 1)] if rows else None
+            if not row:
+                return [("Opcje PR", PR_MENU)]
+            st = self.pr_state(row)
+            entries = [(k, d, st[k]) if k in st and st[k] else (k, d) for k, d in PR_MENU]
+            return [("Opcje PR", entries)]
+        return MENU
+
+    def pr_state(self, row):
+        return pr_menu_state(row, self.prs.get(row["branch"]), self.pr_status, bool(shutil.which("gh")))
+
     def draw_help(self, h, w):
-        """Yazi-like key hint panel docked to the bottom of the screen."""
-        kw = max(len(k) for k, _ in HELP)
-        dw = max(len(d) for _, d in HELP)
-        col_w = kw + 3 + dw + 3
-        ncols = max(1, min(4, (w - 4) // col_w))
-        per = -(-len(HELP) // ncols)
-        ph = min(h - 1, per + 2)
+        """Yazi-like key hint menu docked to the bottom: category columns on solid black."""
+        cols = self.menu_columns()
+        sep = self.sym["arrow"]
+        widths = []
+        for head, entries in cols:
+            kw = max(len(e[0]) for e in entries)
+            widths.append((kw, max(len(head), max(kw + 3 + len(e[1]) + (len(e[2][0]) + 3 if len(e) > 2 else 0)
+                                                  for e in entries)) + 3))
+        # Greedy grid: put columns side by side while they fit, wrap to a new band otherwise.
+        bands, cur, used = [], [], 0
+        for i, (kw, cw) in enumerate(widths):
+            if cur and used + cw > w - 3:
+                bands.append(cur)
+                cur, used = [], 0
+            cur.append(i)
+            used += cw
+        bands.append(cur)
+        note = textwrap.wrap(self.menu_note, max(10, w - 6))[:2] if self.menu == "pr" and self.menu_note else []
+        need = len(note) + sum(1 + max(len(cols[i][1]) for i in band) + (1 if n else 0) for n, band in enumerate(bands))
+        ph = min(h - 1, need + 2)
         y0 = h - ph
-        self.box(y0, 0, ph, w, title="Skróty")
-        for n, (k, d) in enumerate(HELP):
-            col, row = divmod(n, per)
-            if row >= ph - 2:
-                continue
-            x = 2 + col * col_w
-            self.segs(h - ph + 1 + row, x, [(k.rjust(kw), "greenb"), (" " + self.sym["arrow"] + " ", "dim"),
-                                           (d, "plain")], max(0, w - 2 - x))
+        black = self.c["m_plain"]
+        for i in range(ph):
+            self.put(y0 + i, 0, " " * (w - 1), black)
+            self.put_ch(y0 + i, w - 1, " ", black)
+        self.box(y0, 0, ph, w, style="m_border", title="Menu" if self.menu == "main" else "Menu / PR", tstyle="m_accentb")
+        y = y0 + 1
+        for n, band in enumerate(bands):
+            if n:
+                y += 1
+            x = 2
+            for i in band:
+                head, entries = cols[i]
+                kw, cw = widths[i]
+                self.put(y, x, head, self.c["m_accentb"], max(0, w - 2 - x))
+                for r, e in enumerate(entries):
+                    if y + 1 + r >= y0 + ph - 1:
+                        break
+                    k, d = e[0], e[1]
+                    if len(e) > 2:  # disabled entry: dimmed, with the short reason
+                        parts = [(k.rjust(kw), "m_dim"), (" " + sep + " ", "m_dim"), (d, "m_dim"),
+                                 (" (" + e[2][0] + ")", "m_yellow")]
+                    else:
+                        parts = [(k.rjust(kw), "m_greenb"), (" " + sep + " ", "m_dim"), (d, "m_plain")]
+                    self.segs(y + 1 + r, x, parts, max(0, w - 2 - x))
+                x += cw
+            y += 1 + max(len(cols[i][1]) for i in band)
+        for n, line in enumerate(note):
+            self.put(y0 + ph - 1 - len(note) + n, 2, line, self.c["m_red"] | curses.A_BOLD, max(0, w - 4))
 
     def draw(self, refresh=True):
         scr = self.scr
@@ -884,7 +1107,7 @@ class App:
             return
         rows = self.visible()
         self.cursor = max(0, min(self.cursor, len(rows) - 1))
-        ph = h - 3
+        ph = h - HDR_H - 2
         self.body_h = body_h = max(1, (ph - 1) // ITEM_PITCH)
         if self.cursor < self.top:
             self.top = self.cursor
@@ -893,15 +1116,12 @@ class App:
         self.top = max(0, min(self.top, max(0, len(rows) - body_h)))
         left_w = min(max(36, w * 9 // 20), w - 20)
 
-        parts = [(" wt ", "accentb"), ("│ ", "border"), (f"worktree: {len(rows)}", "plain")]
-        if self.base:
-            parts += [("  │ ", "border"), ("baza: ", "dim"), (self.base, "greenb")]
-        if self.filter:
-            parts += [("  │ ", "border"), ("filtr: ", "dim"), (self.filter, "yellow")]
-        self.segs(0, 0, parts, w - 1)
-
-        self.draw_list(rows, 1, 0, ph, left_w)
-        self.draw_detail(rows, 1, left_w, ph, w - left_w)
+        self.draw_header(rows, w)
+        self.draw_list(rows, HDR_H, 0, ph, left_w)
+        if self.on_header:
+            self.draw_main_detail(HDR_H, left_w, ph, w - left_w)
+        else:
+            self.draw_detail(rows, HDR_H, left_w, ph, w - left_w)
 
         if self.show_help:
             self.draw_help(h, w)
@@ -1180,29 +1400,66 @@ class App:
                 continue
             rows = self.visible()
             self.cursor = max(0, min(self.cursor, len(rows) - 1))
-            row = rows[self.cursor] if rows else None
+            row = rows[self.cursor] if rows and not self.on_header else None  # no row actions on the header
             page = self.body_h
+            if self.show_help and self.menu == "pr":
+                self.menu_note = ""
+                if key in (ord("h"), 27, curses.KEY_BACKSPACE, 127, 8):
+                    self.menu = "main"
+                elif key == ord(" "):
+                    self.show_help = False
+                    self.menu = "main"
+                elif row and key in PR_KEYS:
+                    blocked = self.pr_state(row).get(chr(key))
+                    if blocked:  # disabled entry: stay in the menu and say why
+                        self.menu_note = blocked[1]
+                        continue
+                    self.show_help = False
+                    self.menu = "main"
+                    self.act(PR_KEYS[key], row)
+                continue
+            if key == ord("g") and not self.pending_g:
+                self.pending_g = True
+                continue
+            gg = self.pending_g and key == ord("g")
+            self.pending_g = False
             if self.show_help and key in (ord(" "), 27):
                 self.show_help = False
             elif key == ord(" "):
                 self.show_help = True
+                self.menu = "main"
+            elif key == ord("p") and row:
+                self.show_help = True
+                self.menu = "pr"
             elif key in (ord("q"), 27):
                 if self.filter and key == 27:
                     self.filter = ""
                     continue
                 break
             elif key in (curses.KEY_UP, ord("k")):
-                self.cursor -= 1
+                if self.on_header:
+                    pass
+                elif self.cursor == 0:
+                    self.on_header = True  # top of the list: move focus to the header (main checkout)
+                else:
+                    self.cursor -= 1
             elif key in (curses.KEY_DOWN, ord("j")):
-                self.cursor += 1
+                if self.on_header:
+                    self.on_header = False
+                else:
+                    self.cursor += 1
             elif key == curses.KEY_PPAGE:
                 self.cursor -= page
+                self.on_header = False
             elif key == curses.KEY_NPAGE:
                 self.cursor += page
-            elif key in (curses.KEY_HOME, ord("g")):
+                self.on_header = False
+            elif key == curses.KEY_HOME or gg:
                 self.cursor = 0
+                self.on_header = False
             elif key in (curses.KEY_END, ord("G")):
                 self.cursor = len(rows) - 1
+                self.on_header = False
             elif key == ord("r"):
                 self.reload()
                 self.message = "odświeżono"
@@ -1217,7 +1474,10 @@ class App:
                 self.run_tests(row)
             elif key == ord("c") and row:
                 self.copy_cd(row)
+            elif key == ord("c") and self.on_header and self.main:
+                self.copy_cd({"path": self.main["path"]})
             elif row and key in ACTION_KEYS:
+                self.show_help = False
                 self.act(ACTION_KEYS[key], row)
 
 
