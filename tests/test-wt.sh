@@ -590,10 +590,25 @@ assert dis(st(pr(state="MERGED"))) == ["M", "c", "d", "m"] and dis(st(pr(state="
 assert dis(st(pr(), status="loading")) == ["M", "c", "d", "m", "p"] and dis(st(pr(), status="err")) == ["M", "c", "d", "m", "p"]
 assert dis(st(gh=False, status="off")) == ["M", "c", "d", "m"]
 assert m.parse_updown("2\t3\n") == (2, 3) and m.parse_updown("") is None and m.parse_updown("x y") is None
+items = m.parse_config("WT_DIR\tdomyślna\t.claude/worktrees\t.claude/worktrees\nWT_BASE\tenv\t\t\nzepsute\n")
+assert [i["key"] for i in items] == ["WT_DIR", "WT_BASE"] and items[1] == {"key": "WT_BASE", "source": "env", "value": "", "default": ""}
+desc, notes = m.config_notes(items[1])
+assert desc and any("środowiskow" in t for t, _ in notes) and any("dozwolony." in t for t, _ in notes)
+_, notes = m.config_notes({"key": "WT_POST_NEW", "source": "repo (.git/wt.conf)", "value": "x", "default": ""})
+assert any("niedozwolony" in t for t, _ in notes) and not any("środowiskow" in t for t, _ in notes)
+assert any(k == "C" for _, es in m.MENU for k, _ in es)
+print("KEYS:" + " ".join(sorted(m.CONFIG_HELP)))
+print("SAFE:" + " ".join(sorted(k for k, (_, ok) in m.CONFIG_HELP.items() if ok)))
 print("AKCJE-OK")
 PY
 )
 contains "plan_action i pochodne" "$out" "AKCJE-OK"
+ui_keys=$(printf '%s\n' "$out" | sed -n 's/^KEYS://p')
+cfg_keys=$($WT config --porcelain | awk -F'\t' '{print $1}' | sort | tr '\n' ' ' | sed 's/ $//')
+[ "$ui_keys" = "$cfg_keys" ] && ok "ui: CONFIG_HELP pokrywa wszystkie klucze wt config" || bad "ui: klucze configu ($ui_keys) != ($cfg_keys)"
+ui_safe=$(printf '%s\n' "$out" | sed -n 's/^SAFE://p')
+wt_safe=$(sed -n 's/^SAFE_KEYS="\(.*\)"$/\1/p' "$WT_BIN" | tr ' ' '\n' | sed '/^$/d' | sort | tr '\n' ' ' | sed 's/ $//')
+[ "$ui_safe" = "$wt_safe" ] && ok "ui: klucze dozwolone we wspólnym .wt.conf zgodne z SAFE_KEYS" || bad "ui: SAFE ($ui_safe) != SAFE_KEYS ($wt_safe)"
 
 echo "-- ui: smoke w pty z fałszywym gh"
 SB=$(mktemp -d); mkdir -p "$SB/bin"

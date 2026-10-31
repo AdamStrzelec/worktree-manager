@@ -211,7 +211,7 @@ MENU = [
     ("Wybrane worktree", [("t", "testy"), ("c", "kopiuj cd"), ("p", "opcje PR >"), ("x", "usuń worktree")]),
     ("Nawigacja", [("j/k ↑/↓", "ruch (k na górze = nagłówek)"), ("gg/G", "góra / dół"), ("PgUp/PgDn", "strona")]),
     ("Widok", [("/", "filtr"), ("r", "odśwież"), ("Esc", "wyczyść filtr")]),
-    ("Ogólne", [("n", "nowy worktree"), ("Space", "zamknij menu"), ("q", "wyjście")]),
+    ("Ogólne", [("n", "nowy worktree"), ("C", "konfiguracja"), ("Space", "zamknij menu"), ("q", "wyjście")]),
 ]
 PR_MENU = [
     ("p", "push / utwórz PR (draft)"), ("d", "draft <-> ready"), ("m", "merge PR"),
@@ -377,6 +377,42 @@ HDR_H = 3  # header block: padding row, content row, padding row
 ITEM_H = 3  # rows per list item: branch + PR/CI, title + conflicts, age + counters
 ITEM_PITCH = ITEM_H + 1  # item rows + one separator row
 MIN_W, MIN_H = 50, 10
+
+
+# Config screen: what each key does and whether the shared (tracked) .wt.conf may set it.
+# Keys that run commands are trusted-only (private .git/wt.conf, global config or env); this
+# mirrors SAFE_KEYS in bin/wt.
+CONFIG_HELP = {
+    "WT_DIR": ("Katalog, w którym powstają nowe worktree (względny od głównego checkoutu albo absolutny).", True),
+    "WT_BASE": ("Gałąź bazowa. Puste = autodetekcja (main, potem master, potem bieżąca gałąź).", True),
+    "WT_LINK": ("Pliki symlinkowane z głównego checkoutu do nowego worktree (nieśledzone, np. .env).", True),
+    "WT_FETCH": ("1 = przed `wt new` pobierz zmiany (fetch + ff-only), 0 = wyłącz.", True),
+    "WT_TEST": ("Komenda testów dla `wt test`. Puste = plik .wt-test albo autodetekcja.", False),
+    "WT_POST_NEW": ("Komenda uruchamiana w nowym worktree po `wt new` (synchronicznie).", False),
+}
+
+
+def parse_config(text):
+    """Parse `wt config --porcelain` (key, source, value, default; tab-separated) into dicts."""
+    items = []
+    for line in text.splitlines():
+        parts = line.split("\t")
+        if len(parts) != 4:
+            continue
+        items.append({"key": parts[0], "source": parts[1], "value": parts[2], "default": parts[3]})
+    return items
+
+
+def config_notes(item):
+    """Short explanation lines for one config item: [(text, style-name)]. Pure."""
+    desc, shared_ok = CONFIG_HELP.get(item["key"], ("", False))
+    notes = []
+    if item["source"] == "env":
+        notes.append(("Ustawione zmienną środowiskową: nadpisuje wszystkie pliki konfiguracyjne.", "yellow"))
+    elif item["source"] == "domyślna":
+        notes.append(("Wartość domyślna (nic tego klucza nie ustawia).", "dim"))
+    notes.append(("Wspólny .wt.conf: " + ("dozwolony." if shared_ok else "niedozwolony (klucz z komendą, tylko prywatnie)."), "dim"))
+    return desc, notes
 
 
 def trunc(s, n):
@@ -1381,6 +1417,80 @@ class App:
             self.message = "! brak pbcopy"
             self.modal("Schowek niedostępny", f"Brak pbcopy. Wpisz ręcznie:\n{cmd}")
 
+    def config_screen(self):
+        """Read-only view of the effective config (`wt config --porcelain`): key, source, value."""
+        rc, out, err = run([WT, "config", "--porcelain"])
+        items = parse_config(out) if rc == 0 else []
+        if not items:
+            self.pending_error = ("Błąd", clean_error(err, "wt config nie powiodło się"))
+            return
+        scr = self.scr
+        cur = 0
+        pending_g = False
+        while True:
+            scr.erase()
+            h, w = scr.getmaxyx()
+            self.box(0, 0, h, w, title="Konfiguracja (podgląd)")
+            iw = w - 4
+            kw = max(len(i["key"]) for i in items)
+            sw = min(24, max(len(i["source"]) for i in items))
+            self.segs(1, 2, [("KLUCZ".ljust(kw + 2), "dim"), ("ŹRÓDŁO".ljust(sw + 2), "dim"), ("WARTOŚĆ", "dim")], iw)
+            for n, it in enumerate(items):
+                y = 2 + n
+                if y >= h - 2:
+                    break
+                sel = n == cur
+                st = (lambda name: "s_" + name if "s_" + name in self.c else "s_plain") if sel else (lambda name: name)
+                src_style = "yellow" if it["source"] == "env" else "dim" if it["source"] == "domyślna" else "green"
+                val_style = "dim" if (not it["value"] or it["source"] == "domyślna") else "accent"
+                if sel:
+                    self.put(y, 1, " " * (w - 2), self.c["s_plain"])
+                bar = self.sym["bar"] if sel else " "
+                self.segs(y, 1, [(bar + " ", st("accentb")), (it["key"].ljust(kw + 2), st("plain")),
+                                 (trunc(it["source"], sw).ljust(sw + 2), st(src_style)),
+                                 (it["value"] or "(puste)", st(val_style))], w - 2)
+            it = items[cur]
+            desc, notes = config_notes(it)
+            y = 3 + len(items)
+            if y < h - 3:
+                self.put(y, 2, self.sym["sep"] * max(0, iw), self.c["border"] | curses.A_DIM)
+                y += 1
+                lines = [(l, "plain") for l in textwrap.wrap(desc, max(10, iw))]
+                lines.append(("", "plain"))
+                lines.append(("Wartość:   " + (it["value"] or "(puste)"), "plain"))
+                lines.append(("Domyślna:  " + (it["default"] or "(puste)"), "plain"))
+                lines.append(("Źródło:    " + it["source"], "plain"))
+                lines.append(("", "plain"))
+                for text, style in notes:
+                    lines += [(l, style) for l in textwrap.wrap(text, max(10, iw))]
+                lines.append(("", "plain"))
+                lines.append(("Zmiana z terminala: wt config set %s WARTOSC | wt config unset %s" % (it["key"], it["key"]), "dim"))
+                for text, style in lines:
+                    if y >= h - 2:
+                        break
+                    self.put(y, 2, text, self.c[style], iw)
+                    y += 1
+            self.put(h - 1, 3, " j/k ruch   Esc/q wróć ", self.c["dim"], max(0, w - 6))
+            scr.refresh()
+            key = scr.getch()
+            if key in (curses.KEY_RESIZE, -1):
+                continue
+            if key == ord("g") and not pending_g:
+                pending_g = True
+                continue
+            gg = pending_g and key == ord("g")
+            pending_g = False
+            if key in (27, ord("q"), ord("h"), ord("C"), curses.KEY_BACKSPACE, 127, 8):
+                return
+            if key in (curses.KEY_DOWN, ord("j")):
+                cur = min(len(items) - 1, cur + 1)
+            elif key in (curses.KEY_UP, ord("k")):
+                cur = max(0, cur - 1)
+            elif key in (curses.KEY_HOME,) or gg:
+                cur = 0
+            elif key in (curses.KEY_END, ord("G")):
+                cur = len(items) - 1
+
     def loop(self):
         try:
             curses.curs_set(0)
@@ -1470,6 +1580,9 @@ class App:
                     self.cursor = 0
             elif key == ord("n"):
                 self.new()
+            elif key == ord("C"):
+                self.show_help = False
+                self.config_screen()
             elif key == ord("t") and row:
                 self.run_tests(row)
             elif key == ord("c") and row:
