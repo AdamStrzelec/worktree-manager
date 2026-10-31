@@ -1,6 +1,6 @@
 # wt: menedżer git worktree
 
-Stan na 2026-10-29. Skrypt: `bin/wt` (zainstalowany jako `~/.local/bin/wt`) (bash, zgodny z bash 3.2, sprawdzony też na bash 5.3 z Homebrew).
+Stan na 2026-10-31. Skrypty: `bin/wt` (bash, zgodny z bash 3.2, sprawdzony też na bash 5.3 z Homebrew) i `bin/wt-ui` (Python 3, curses; interfejs `wt ui`).
 
 Cel: fizyczna izolacja plików między równoległymi sesjami (każdy feature we własnym worktree) i jedna bramka powrotu na gałąź bazową (`wt merge`: testy, rebase, testy, `merge --ff-only`).
 
@@ -15,15 +15,19 @@ Cel: fizyczna izolacja plików między równoległymi sesjami (każdy feature we
 | 3 | `wt test` (`.wt-test`, `WT_TEST`, autodetekcja) | gotowe |
 | 4 | `wt status` (detektor kolizji) | gotowe |
 | 2b | `wt new`: synchronizacja bazy z upstreamem (`fetch` + `ff-only`), `--no-fetch`, `WT_FETCH` | gotowe |
+| 6 | `wt drop <temat> [--check] [--merged-pr]` (bez force) | gotowe |
+| UI | `wt ui`: lista, szczegóły, nagłówek z checkoutem głównym, menu Spacji, PR/CI, push/PR/merge, modal tworzenia | gotowe (testy pty-smoke i ręczne) |
+| cfg | `wt config set/unset/--porcelain`, ekran Config w UI (`C`), `E` = `.git/wt.conf` w `$EDITOR` | gotowe |
+| 7 | `WT_COPY` (kopie zamiast symlinków) | gotowe |
+| 8 | Hooki `WT_PRE_DROP` / `WT_POST_DROP` | gotowe |
 
-Weryfikacja: 129 testów w skrypcie testowym (0 błędów) na bash 5.3 i na `/bin/bash` 3.2, `bash -n` oraz `shellcheck` bez uwag.
+Weryfikacja: 235 testów w skrypcie testowym (0 błędów) na bash 5.3 i na `/bin/bash` 3.2, `bash -n` oraz `shellcheck` bez uwag.
 
 ### Do zrobienia
 
 | Slice | Zakres |
 |---|---|
 | 5 | `wt merge <temat>` (bramka powrotu na bazę) |
-| 6 | `wt drop <temat> [--yes]` (sprzątanie) |
 | 7 | Końcowy przebieg: `bash -n`, `shellcheck`, pełne testy na obu wersjach basha |
 | 8 | Blok komend do ręcznego uruchomienia (każda w jednej linii) |
 
@@ -69,11 +73,14 @@ Tylko to, co wynika z komend. Nigdy `git add -A`, `reset --hard`, `push` ani for
 
 | Komenda | Co robi pod spodem |
 |---|---|
-| `wt new <temat> [--no-fetch]` | Waliduje nazwę (regex `^[A-Za-z0-9][A-Za-z0-9._/-]*$`, bez `..`, `//`, końcowego `/` i `.lock`, plus `git check-ref-format`). Odmawia, gdy ścieżka lub gałąź istnieje albo baza ma zmiany w plikach trackowanych (pokazuje `git status --short`). Przed utworzeniem synchronizuje bazę z upstreamem (niżej). Wykonuje `git worktree add -b <temat> <WT_ROOT>/<temat> <baza>`. Linkuje symlinkami istniejące pliki z `WT_LINK`. Zapisuje `.wt-owner`. Dopisuje do `info/exclude`. Uruchamia `WT_POST_NEW`. Wypisuje gałąź, krótki hash bazy i `cd <ścieżka>` |
+| `wt new <temat> [--no-fetch]` | Waliduje nazwę (regex `^[A-Za-z0-9][A-Za-z0-9._/-]*$`, bez `..`, `//`, końcowego `/` i `.lock`, plus `git check-ref-format`). Odmawia, gdy ścieżka lub gałąź istnieje albo baza ma zmiany w plikach trackowanych (pokazuje `git status --short`). Przed utworzeniem synchronizuje bazę z upstreamem (niżej). Wykonuje `git worktree add -b <temat> <WT_ROOT>/<temat> <baza>`. Linkuje symlinkami istniejące pliki z `WT_LINK`, a pliki z `WT_COPY` kopiuje. Zapisuje `.wt-owner`. Dopisuje do `info/exclude`. Uruchamia `WT_POST_NEW`. Wypisuje gałąź, krótki hash bazy i `cd <ścieżka>` |
 | `wt list` / `wt ls` | Czyta `git worktree list --porcelain`, pomija główny checkout. Kolumny: GALAZ, WIEK (`git log -1 --format=%cr`), AHEAD (`rev-list --count baza..gałąź`), BRUDNE (liczba linii `status --porcelain`), WLASCICIEL ("zajęty (pid N, panel)" jeśli `kill -0` na pid z `.wt-owner` się powiedzie, w przeciwnym razie "wolny") |
 | `wt status` | Dla każdej pary worktree liczy wspólne zmienione pliki. Zmienione pliki to suma: `diff merge-base..HEAD`, `diff HEAD` i nietrackowane niezignorowane (`ls-files --others --exclude-standard`). Wypisuje `KOLIZJA a ↔ b:` z listą albo "brak wspólnych plików", na końcu `list`. Pliki tymczasowe w `mktemp -d`, sprzątane trapem EXIT |
 | `wt test [args]` | Wybiera komendę testową: `WT_TEST` (zaufane źródła), potem pierwsza linia `.wt-test` w korzeniu worktree, potem autodetekcja. Uruchamia ją w korzeniu bieżącego worktree (`git rev-parse --show-toplevel`) z przekazaniem argumentów. Zwraca kod wyjścia komendy. Brak komendy to kod 127 z instrukcją |
-| `wt config` | Pokazuje repo, bazę, katalog worktree oraz efektywne wartości wszystkich kluczy z informacją, skąd pochodzą |
+| `wt config` | Pokazuje repo, bazę, katalog worktree oraz efektywne wartości wszystkich kluczy z informacją, skąd pochodzą. `--porcelain`: TSV `klucz, źródło, wartość, domyślna` (bez nagłówka) |
+| `wt config set KLUCZ WARTOŚĆ` / `unset KLUCZ` | Zapis i usuwanie klucza w prywatnym `.git/wt.conf` (atomowo, komentarze zachowane, walidacja wartości; ostrzega, gdy wygrywa inne źródło, np. env) |
+| `wt drop <temat> [--check] [--merged-pr]` | Usuwa worktree (`git worktree remove`, bez force) i gałąź (`branch -d`, nigdy `-D`). Odmawia przy zmianach niezacommitowanych, żywym właścicielu, commitach niezmergowanych do targetu (`wt-target`, a bez niego bazy) albo gdy stoisz w tym worktree. `--check` tylko sprawdza, `--merged-pr` oznacza, że PR jest zmergowany na GitHubie. Odpala hooki `WT_PRE_DROP` / `WT_POST_DROP` |
+| `wt ui` | Interfejs w terminalu (sekcja 5) |
 | `wt` (bez argumentu) / nieznana komenda | Help na stderr (lista komend plus ścieżka repo), `exit 1` |
 
 Autodetekcja komendy testowej (kolejność): `pnpm-lock.yaml` + `package.json` ze skryptem `test` → `pnpm test`; `package.json` ze skryptem `test` → `npm test`; `pyproject.toml` → `uv run pytest`; `Cargo.toml` → `cargo test`; `go.mod` → `go test ./...`; `Makefile` z celem `test` → `make test`. `package.json` bez skryptu `test` jest pomijany.
@@ -83,7 +90,6 @@ Autodetekcja komendy testowej (kolejność): `pnpm-lock.yaml` + `package.json` z
 | Komenda | Plan |
 |---|---|
 | `wt merge <temat>` | (1) worktree czysty włącznie z nietrackowanymi, baza czysta w trackowanych, gałąź ma commity ponad bazą; (2) `wt test`, przy czerwonych błąd i baza nietknięta; (3) `git rebase <baza>` w worktree, przy konflikcie lista plików (`--diff-filter=U`) i instrukcja `--continue` / `--abort`; (4) `wt test` ponownie; (5) `git -C $MAIN merge --ff-only <temat>`, przy odmowie komunikat o powtórzeniu; (6) wypisanie nowego HEAD bazy i podpowiedź `wt drop`. Worktree zostaje |
-| `wt drop <temat> [--yes]` | Bez `--yes` pokazuje rozmiar katalogu (bez symlinków), commity spoza bazy i niezacommitowane pliki, kończy błędem "nic nie usunięto". Z `--yes`: `git worktree remove --force`, gałąź kasowana przez `branch -d` tylko gdy wszystko jest na bazie, w przeciwnym razie zostaje i dostajesz instrukcję `branch -D` |
 
 ## 4. Konfiguracja: gdzie jest zapisywana
 
@@ -93,7 +99,7 @@ Nie ma żadnej globalnej mapy "repo X ma takie ustawienia". Konfiguracja jest w 
 |---|---|---|---|
 | zmienna środowiskowa | nie | wszystkie | jednorazowe nadpisanie, np. `WT_DIR=... wt new x` |
 | `<repo>/.git/wt.conf` | nie | wszystkie | Twoje prywatne ustawienia projektu. Znika razem z klonem |
-| `<repo>/.wt.conf` | tak | tylko `WT_DIR`, `WT_BASE`, `WT_LINK` | wspólne dla zespołu. Klucze uruchamiające komendy są ignorowane z komunikatem |
+| `<repo>/.wt.conf` | tak | tylko `WT_DIR`, `WT_BASE`, `WT_LINK`, `WT_COPY`, `WT_FETCH` | wspólne dla zespołu. Klucze uruchamiające komendy są ignorowane z komunikatem |
 | `<repo>/.wt-test` | tak | pierwsza linia = komenda testowa | wspólna komenda testowa. Linie puste i `#` są pomijane |
 | `~/.config/wt/config` (lub `$XDG_CONFIG_HOME/wt/config`) | poza repo | wszystkie | Twoje domyślne dla wszystkich repo. Plik nie istnieje, dopóki go nie utworzysz |
 
@@ -106,9 +112,23 @@ Format: `KLUCZ=wartość`, jedna para na linię, komentarze `#`, opcjonalne cudz
 | `WT_DIR` | `.claude/worktrees` | katalog na worktree. Względny liczy się od głównego checkoutu, może wychodzić poza repo (`../x`) lub być absolutny |
 | `WT_BASE` | puste (autodetekcja: `main`, `master`, bieżąca gałąź) | gałąź bazowa |
 | `WT_LINK` | `.env .venv` | lista plików symlinkowanych z głównego checkoutu, tylko istniejące |
+| `WT_COPY` | puste | lista plików lub katalogów KOPIOWANYCH z głównego checkoutu (np. `.env.local`), gdy ma być niezależna kopia zamiast symlinka. Nie nadpisuje istniejących, brakujące pomija, wpis trafia do `info/exclude`. Walidacja jak `WT_LINK` (ścieżki względne, bez `..`) |
 | `WT_FETCH` | `1` | `0` wyłącza synchronizację bazy z upstreamem w `wt new` (bezpieczny klucz, dozwolony też w `.wt.conf`) |
 | `WT_TEST` | puste | komenda testowa (zaufane źródła) |
 | `WT_POST_NEW` | puste | komenda po `wt new`, uruchamiana w nowym worktree (zaufane źródła). Przy błędzie worktree zostaje, a `wt new` zwraca ten sam kod wyjścia |
+| `WT_PRE_DROP` | puste | komenda przed `wt drop`, po wszystkich sprawdzeniach (zaufane źródła, nigdy `.wt.conf`). Błąd = weto: nic nie jest usuwane |
+| `WT_POST_DROP` | puste | komenda po udanym `git worktree remove` (zaufane źródła). Błąd tylko ostrzega, niczego nie cofa |
+
+Hooki `drop` dostają zmienne `WT_NAME`, `WT_PATH`, `WT_BRANCH`, `WT_MAIN` i działają z głównego checkoutu (worktree jest wtedy usuwane). `wt drop --check` ich nie uruchamia. Działają też, gdy drop idzie z UI (`x`, `M`).
+
+Przepis: sesja tmux o nazwie worktree, tworzona i zabijana razem z nim (domyślnie nic takiego się nie dzieje):
+
+```
+WT_POST_NEW=tmux new-session -d -s "$(basename "$PWD")" -c "$PWD"
+WT_POST_DROP=tmux kill-session -t "$WT_NAME" 2>/dev/null; true
+```
+
+Edycja configu bez ręcznego pliku: `wt config set KLUCZ WARTOŚĆ`, `wt config unset KLUCZ` albo ekran Config w `wt ui` (`C`). Zapis idzie zawsze do prywatnego `.git/wt.conf`; wspólnego `.wt.conf` UI nie rusza. Zmiana `WT_DIR` nie przenosi istniejących worktree (`wt list` bierze je z `git worktree list`).
 
 Zmienne środowiska czytane przez skrypt: `CLAUDE_SESSION_ID`, `TMUX_PANE`, `USER`, `XDG_CONFIG_HOME`, `WT_FETCH_TIMEOUT` (sekundy, domyślnie 20, limit czasu `git fetch`).
 
@@ -149,7 +169,26 @@ WT_POST_NEW=npm install
 | `<repo>/.git/info/exclude` | `.wt-owner`, `/<link>` dla każdego utworzonego symlinku (wzorzec `node_modules/` z `.gitignore` nie dopasowuje symlinka), a gdy `WT_DIR` leży w repo także `/<WT_DIR>/`. Wpisy są wspólne dla wszystkich worktree tego repo. Zapis chroniony blokadą `mkdir` (macOS nie ma `flock`) |
 | `<repo>/.git/wt.lock` | chwilowy katalog blokady, usuwany po zapisie |
 
-## 5. Przykładowy flow
+## 5. `wt ui`
+
+Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wiek), szczegóły po prawej, na górze nagłówek (`k` z pierwszego worktree przechodzi na niego i pokazuje szczegóły głównego checkoutu: origin w tyle/do przodu, zmiany). Stan PR i CI pochodzi z GitHuba (`gh pr list` w tle).
+
+| Klawisz | Akcja |
+|---|---|
+| `j`/`k`, strzałki, `gg`/`G`, PgUp/PgDn | ruch |
+| `Space` | menu skrótów w kategoriach (Wybrane worktree, Nawigacja, Widok, Ogólne) |
+| `n` | modal nowego worktree (nazwa, target branch, tytuł) |
+| `t` | testy w sfokusowanym worktree |
+| `c` | kopiuje `cd <ścieżka>` do schowka (`pbcopy`) |
+| `p` | podmenu PR: `p` push / utwórz PR (draft), `d` draft <-> ready, `m` merge PR, `M` merge + usuń worktree, `c` zamknij PR. Niedostępne opcje są wygaszone zgodnie ze stanem PR |
+| `x` | `wt drop` (z `--merged-pr`, gdy PR zmergowany) |
+| `C` | ekran konfiguracji: `j`/`k`, `Enter` edytuj klucz, `d` przywróć domyślną, `E` otwórz `.git/wt.conf` w `$VISUAL`/`$EDITOR`, `Esc` wróć |
+| `/`, `r`, `Esc` | filtr, odśwież, wyczyść filtr |
+| `q` | wyjście |
+
+Każda akcja z efektem pokazuje modal z dokładną komendą; błędy trafiają do czerwonego modala. Push i `gh` żyją tylko w `wt-ui`, po potwierdzeniu, nigdy z force. Przy tworzeniu PR base to `wt-target`, tytuł to `wt-title` (albo nazwa gałęzi). Ręczna edycja pliku przez `E` nie przechodzi walidacji `config set` (ostrzega tylko o literówkach w kluczach).
+
+## 6. Przykładowy flow
 
 ### Pierwszy raz w nowym repo
 

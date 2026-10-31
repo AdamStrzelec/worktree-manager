@@ -7,8 +7,8 @@ Pełny opis działania, konfiguracji i planów jest w [docs/wt-manager.md](docs/
 ## Stan projektu
 
 | Komenda | Stan |
-|---|---|
-| `wt new`, `wt list`, `wt status`, `wt test`, `wt config` | gotowe i przetestowane |
+| --- | --- |
+| `wt new`, `wt list`, `wt status`, `wt test`, `wt config` (też `set`/`unset`) | gotowe i przetestowane |
 | `wt ui` | gotowe: interfejs w terminalu (wymaga `python3`), testowane tylko ręcznie i pty-smoke |
 | `wt drop` | gotowe i przetestowane (patrz "Usuwanie worktree" niżej) |
 | `wt merge` | jeszcze niezaimplementowane (komenda zwraca błąd "jeszcze niezaimplementowana"); zmergowanie robi się ręcznie gitem albo przez PR w `wt ui` |
@@ -25,7 +25,7 @@ Pełny opis działania, konfiguracji i planów jest w [docs/wt-manager.md](docs/
 Skrypt to `bin/wt` plus `bin/wt-ui` (interfejs `wt ui`, Python 3, bez zależności). `wt ui` szuka `wt-ui` obok prawdziwego pliku `wt`, więc przy kopiowaniu skopiuj oba pliki. Zalecana instalacja to symlink, bo `git pull` aktualizuje wtedy zainstalowaną wersję automatycznie.
 
 ```bash
-git clone <URL-repo> ~/repozytoria/worktree-manager
+git clone https://github.com/AdamStrzelec/worktree-manager ~/repozytoria/worktree-manager
 ```
 
 ```bash
@@ -91,7 +91,7 @@ wt status
 - `wt test` uruchamia testy w bieżącym worktree (komenda z konfiguracji, z pliku `.wt-test` albo wykryta automatycznie).
 - `wt list` pokazuje worktree: wiek ostatniego commita, liczbę commitów ponad bazą, liczbę brudnych plików i właściciela.
 - `wt status` wykrywa kolizje: pliki zmieniane jednocześnie w więcej niż jednym worktree.
-- `wt ui` otwiera interfejs: lista worktree po lewej, szczegóły i kolizje po prawej. Klawisze: `j`/`k` lub strzałki, `g`/`G`, `n` nowy worktree, `t` testy, `c` kopiuje `cd <ścieżka>` do schowka (`pbcopy`), `p` push/PR, `d` draft/ready, `m` merge PR, `x` usuń worktree, `M` merge + usuń (szczegóły niżej), `r` odśwież, `/` filtr, `q` wyjście.
+- `wt ui` otwiera interfejs: lista worktree po lewej, szczegóły i kolizje po prawej. Klawisze: `j`/`k` lub strzałki, `g`/`G`, `n` nowy worktree, `t` testy, `c` kopiuje `cd <ścieżka>` do schowka (`pbcopy`), `p` otwiera podmenu PR (push/PR, draft/ready, merge, merge + usuń, zamknij), `x` usuń worktree, `C` ekran konfiguracji, `Space` menu skrótów, `r` odśwież, `/` filtr, `q` wyjście. Pełna lista w [docs/wt-manager.md](docs/wt-manager.md).
 - `wt list --porcelain` daje wyjście dla skryptów: ścieżka, gałąź, wiek, ahead, brudne, właściciel, rozdzielone tabulatorem.
 
 Komendy działają z dowolnego miejsca repo, także z wnętrza worktree.
@@ -107,15 +107,18 @@ WT_POST_NEW=npm install
 ```
 
 | Klucz | Domyślnie | Znaczenie |
-|---|---|---|
+| --- | --- | --- |
 | `WT_DIR` | `.claude/worktrees` | gdzie tworzyć worktree (względem głównego checkoutu albo absolutnie) |
 | `WT_BASE` | autodetekcja | gałąź bazowa |
 | `WT_LINK` | `.env .venv` | pliki symlinkowane z głównego checkoutu do nowego worktree |
+| `WT_COPY` | brak | pliki KOPIOWANE z głównego checkoutu (np. `.env.local`), niezależne od oryginału, bez nadpisywania |
 | `WT_FETCH` | `1` | `0` wyłącza pobieranie zmian z upstreamu przed `wt new` |
 | `WT_TEST` | brak (autodetekcja) | komenda testowa |
 | `WT_POST_NEW` | brak | komenda uruchamiana po `wt new` w nowym worktree |
+| `WT_PRE_DROP` | brak | komenda przed `wt drop`; błąd blokuje usunięcie |
+| `WT_POST_DROP` | brak | komenda po udanym usunięciu worktree; błąd tylko ostrzega |
 
-Wspólne ustawienia całego zespołu mogą trafić do `.wt.conf` w repo, ale tylko klucze `WT_DIR`, `WT_BASE` i `WT_LINK`. Komendy (`WT_TEST`, `WT_POST_NEW`) są z tego pliku ignorowane ze względów bezpieczeństwa. Wspólną komendę testową zapisz w pliku `.wt-test` (jedna linia).
+Wspólne ustawienia całego zespołu mogą trafić do `.wt.conf` w repo, ale tylko klucze `WT_DIR`, `WT_BASE`, `WT_LINK`, `WT_COPY` i `WT_FETCH`. Komendy (`WT_TEST`, `WT_POST_NEW`, `WT_PRE_DROP`, `WT_POST_DROP`) są z tego pliku ignorowane ze względów bezpieczeństwa. Wspólną komendę testową zapisz w pliku `.wt-test` (jedna linia).
 
 Sprawdzenie, co jest ustawione i skąd pochodzi każda wartość:
 
@@ -123,19 +126,22 @@ Sprawdzenie, co jest ustawione i skąd pochodzi każda wartość:
 wt config
 ```
 
+Zmiana wartości bez ręcznej edycji pliku (zapis do prywatnego `.git/wt.conf`): `wt config set KLUCZ WARTOŚĆ`, `wt config unset KLUCZ`, albo klawisz `C` w `wt ui`. Hooki `drop` dostają zmienne `WT_NAME`, `WT_PATH`, `WT_BRANCH`, `WT_MAIN`; przepis na sesję tmux jest w [docs/wt-manager.md](docs/wt-manager.md).
+
 ## Usuwanie worktree i akcje na PR
 
 `wt drop <temat>` usuwa worktree (`git worktree remove`, bez force) i gałąź (`git branch -d`, nigdy `-D`) oraz kasuje `branch.<n>.wt-*` z configu. Odmawia, gdy: są niezacommitowane zmiany, gałąź ma commity niezmergowane do targetu (`wt-target`, a bez niego bazy), właściciel (`.wt-owner`) żyje (poza procesem, który sam wywołuje `drop`), albo stoisz w tym worktree. Opcje: `--check` (tylko sprawdza, nic nie usuwa), `--merged-pr` (wywołujący zapewnia, że PR jest zmergowany na GitHubie, więc commity niezmergowane lokalnie są dozwolone; gałąź i tak musi być zmergowana do swojego upstreamu lub HEAD, bo inaczej `branch -d` odmówi).
 
-W `wt ui` na sfokusowanym worktree (też pod Spacją), każda akcja pokazuje modal z opisem i dokładną komendą, a błędy trafiają do czerwonego modala:
+W `wt ui` na sfokusowanym worktree klawisz `p` otwiera podmenu PR (`x` usuwa worktree wprost; wszystko też pod Spacją). Każda akcja pokazuje modal z opisem i dokładną komendą, a błędy trafiają do czerwonego modala:
 
-| Klawisz | Akcja |
-|---|---|
+| W podmenu `p` | Akcja |
+| --- | --- |
 | `p` | `git push -u origin <gałąź>` i, jeśli nie ma otwartego PR, `gh pr create --draft` (base z `wt-target`, tytuł z `wt-title` lub nazwa gałęzi) |
 | `d` | draft <-> ready (`gh pr ready` / `--undo`) |
 | `m` | `gh pr merge <nr> --merge` (tylko otwarty, nie draft, bez konfliktów, CI nie czerwone) |
 | `x` | `wt drop` (z `--merged-pr`, gdy PR jest zmergowany) |
 | `M` | sprawdzenie `wt drop --check`, merge PR, potem `wt drop` |
+| `c` | zamknięcie PR |
 
 Push i `gh` żyją wyłącznie w `wt-ui`, po potwierdzeniu, nigdy z force. Stan PR zawsze pochodzi z GitHuba (po akcji UI odpytuje `gh` ponownie). Wymaga `gh` w PATH i `gh auth login`; bez tego akcje na PR pokazują czytelny błąd (sam push działa bez `gh`).
 
