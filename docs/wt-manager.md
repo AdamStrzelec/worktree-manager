@@ -171,7 +171,7 @@ WT_POST_NEW=npm install
 
 ## 5. `wt ui`
 
-Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wiek), szczegóły po prawej, na górze nagłówek (`k` z pierwszego worktree przechodzi na niego i pokazuje szczegóły głównego checkoutu: origin w tyle/do przodu, zmiany). Stan PR i CI pochodzi z GitHuba (`gh pr list` w tle).
+Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wiek), szczegóły po prawej, na górze nagłówek (`k` z pierwszego worktree przechodzi na niego i pokazuje szczegóły głównego checkoutu: origin w tyle/do przodu, zmiany). Stan PR i CI pochodzi z GitHuba (`gh pr list` w tle). W szczegółach worktree każdy commit ponad bazą ma znacznik: `✓` jest już na origin, `↑` tylko lokalnie (do wypchnięcia). Liczone z refów `origin/*` z ostatniego fetch, bez sieci.
 
 | Klawisz | Akcja |
 |---|---|

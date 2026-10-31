@@ -373,6 +373,19 @@ def pr_menu_state(row, pr, pr_status, has_gh):
 
 # key -> action kind (see plan_action)
 ACTION_KEYS = {ord("x"): "drop"}  # direct keys on the focused worktree
+def commit_mark(sha, local):
+    """(glyph, style) for a commit: ↑ local-only, ✓ on origin, · when unknown (git failed). Pure.
+
+    local is the set of abbreviated SHAs not on any origin ref; abbreviations may differ in
+    length between git calls, so match by prefix in both directions.
+    """
+    if local is None:
+        return ("·", "dim")
+    if any(sha.startswith(l) or l.startswith(sha) for l in local):
+        return ("↑", "accent")
+    return ("✓", "green")
+
+
 def open_menu_state(row, pr, pr_status, has_gh):
     """Availability of the Open submenu keys: {key: None | (short, full)}; None = enabled. Pure."""
     # tmux: placeholder until `wt new` creates a tmux session per worktree.
@@ -850,17 +863,26 @@ class App:
             _, out, _ = run(["git", "-C", row["path"], "log", "--oneline", "-n", "8",
                              f"{self.base}..HEAD"])
             commits = out.strip().splitlines()
+            # Commits reachable from no origin/* ref = not pushed yet (uses last fetch, no network).
+            rc, out, _ = run(["git", "-C", row["path"], "rev-list", "--abbrev-commit", "HEAD",
+                              "--not", "--remotes=origin", f"^{self.base}"])
+            local = set(out.split()) if rc == 0 else None
         else:
-            commits = []
+            commits, local = [], None
         _, out, _ = run(["git", "-C", row["path"], "status", "--short"])
         changed = out.strip().splitlines()
         lines = []
         lines.append([(f"Commity ponad {self.base or 'bazą'}", "accentb")])
         for cm in commits:
             sha, _, msg = cm.partition(" ")
-            lines.append([("  " + sha + " ", "yellow"), (msg, "plain")])
+            mark = commit_mark(sha, local)
+            lines.append([("  " + mark[0] + " ", mark[1]), (sha + " ", "yellow"), (msg, "plain")])
         if not commits:
             lines.append([("  (brak)", "dim")])
+        elif local is not None:
+            n = sum(1 for cm in commits if commit_mark(cm.split(" ", 1)[0], local)[0] == "↑")
+            lines.append([("  ✓ na origin   ↑ tylko lokalnie", "dim"),
+                          (f"   ({n} do wypchnięcia)" if n else "   (wszystko wypchnięte)", "yellow" if n else "dim")])
         lines.append([])
         lines.append([("Zmiany niezacommitowane", "accentb")])
         for ch in changed[:15]:
