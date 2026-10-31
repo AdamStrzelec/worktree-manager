@@ -235,7 +235,7 @@ usage() {
     printf '  status                  kolizje plików między worktree\n'
     printf '  test [args]             testy w bieżącym worktree\n'
     printf '  merge <temat>           testy, rebase, testy, merge --ff-only\n'
-    printf '  drop <temat> [--yes]    usuń worktree (bez --yes tylko podgląd)\n'
+    printf '  drop <temat>            usuń worktree i gałąź (tylko gdy bezpieczne)\n'
     printf '  ui                      interfejs w terminalu (curses)\n'
     printf '  config                  efektywna konfiguracja i jej źródła\n\n'
     printf 'Repo: %s\n' "${repo:-(poza repo git)}"
@@ -351,18 +351,28 @@ sync_base() {
 }
 
 cmd_new() {
-  local name="" path f post_rc=0 rel hash do_fetch=1 arg
-  for arg in "$@"; do
-    case "$arg" in
+  local name="" path f post_rc=0 rel hash do_fetch=1 target="" title=""
+  local usage="użycie: wt new <temat> [--target <gałąź>] [--title <tytuł>] [--no-fetch]"
+  while [ $# -gt 0 ]; do
+    case "$1" in
       --no-fetch) do_fetch=0 ;;
-      -*)         die "nieznana opcja: $arg" ;;
+      --target)   [ $# -ge 2 ] || die "$usage"; target=$2; shift ;;
+      --title)    [ $# -ge 2 ] || die "$usage"; title=$2; shift ;;
+      -*)         die "nieznana opcja: $1" ;;
       *)
-        [ -n "$name" ] && die "użycie: wt new <temat> [--no-fetch]"
-        name=$arg ;;
+        [ -n "$name" ] && die "$usage"
+        name=$1 ;;
     esac
+    shift
   done
-  [ -n "$name" ] || die "użycie: wt new <temat> [--no-fetch]"
+  [ -n "$name" ] || die "$usage"
   init_repo
+  if [ -n "$target" ]; then
+    git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$target" >/dev/null \
+      || die "gałąź docelowa '$target' nie istnieje"
+    BASE=$target
+  fi
+  title=$(printf '%s' "$title" | tr '\t\n\r' '   ')
   valid_name "$name"
   path="$WT_ROOT/$name"
   [ -e "$path" ] && die "ścieżka już istnieje: $path"
@@ -378,6 +388,9 @@ cmd_new() {
   fi
 
   git -C "$MAIN" worktree add -q -b "$name" "$path" "$BASE" || die "git worktree add nie powiodło się"
+  # Per-branch metadata (git removes it together with the branch).
+  git -C "$MAIN" config "branch.$name.wt-target" "$BASE"
+  if [ -n "$title" ]; then git -C "$MAIN" config "branch.$name.wt-title" "$title"; fi
 
   for f in $CFG_WT_LINK; do
     if [ -e "$MAIN/$f" ] || [ -L "$MAIN/$f" ]; then
@@ -599,7 +612,87 @@ cmd_ui() {
   WT_CMD="$src" exec python3 "$dir/wt-ui" "$@"
 }
 cmd_merge()  { not_implemented merge; }
-cmd_drop()   { not_implemented drop; }
+# find_worktree BRANCH - print the path of the (non-main) worktree on BRANCH, or return 1.
+find_worktree() {
+  local want=$1 line wpath="" branch="" first=1
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in
+      "worktree "*) wpath=${line#worktree }; branch="(detached)" ;;
+      "branch "*)   branch=${line#branch refs/heads/} ;;
+      "")
+        if [ -n "$wpath" ]; then
+          if [ "$first" = 1 ]; then first=0; elif [ "$branch" = "$want" ]; then
+            printf '%s' "$wpath"
+            return 0
+          fi
+        fi
+        wpath="" ;;
+    esac
+  done < <(git -C "$MAIN" worktree list --porcelain; echo)
+  return 1
+}
+
+# cmd_drop - remove a worktree and its branch, only when nothing can be lost.
+# Safe flags only (no force, no -D). --merged-pr: caller asserts the PR is merged on GitHub,
+# so commits not merged locally are allowed. --check: run all checks, remove nothing.
+cmd_drop() {
+  local name="" check=0 merged_pr=0 usage="użycie: wt drop <temat> [--merged-pr] [--check]"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --check)     check=1 ;;
+      --merged-pr) merged_pr=1 ;;
+      -*)          die "nieznana opcja: $1" ;;
+      *)
+        [ -n "$name" ] && die "$usage"
+        name=$1 ;;
+    esac
+    shift
+  done
+  [ -n "$name" ] || die "$usage"
+  init_repo
+  valid_name "$name"
+  local wpath dirty pid target ahead here upref
+  wpath=$(find_worktree "$name") || die "nie ma worktree na gałęzi '$name'"
+  here=$(pwd -P)
+  case "$here/" in "$wpath"/*) die "stoisz w tym worktree, przejdź do innego katalogu" ;; esac
+
+  dirty=$(git -C "$wpath" status --porcelain 2>/dev/null | wc -l | tr -d ' ')
+  [ "$dirty" != 0 ] && die "worktree '$name' ma niezacommitowane zmiany ($dirty), zacommituj albo odrzuć je ręcznie"
+
+  # An owner that is the calling process itself (e.g. the UI that created it) does not block.
+  if [ -f "$wpath/.wt-owner" ]; then
+    pid=$(owner_field "$wpath/.wt-owner" pid)
+    if [ -n "$pid" ] && [ "$pid" != "$PPID" ] && kill -0 "$pid" 2>/dev/null; then
+      die "worktree '$name' jest zajęty (pid $pid), zakończ tę sesję"
+    fi
+  fi
+
+  target=$(git -C "$MAIN" config --get "branch.$name.wt-target" 2>/dev/null) || target=""
+  [ -n "$target" ] || target=$BASE
+  git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$target" >/dev/null \
+    || die "gałąź docelowa '$target' nie istnieje"
+  ahead=$(git -C "$MAIN" rev-list --count "$target..$name" 2>/dev/null) || ahead="?"
+  if [ "$ahead" != 0 ] && [ "$merged_pr" != 1 ]; then
+    die "gałąź '$name' ma $ahead commit(ów) niezmergowanych do '$target'"
+  fi
+
+  # Mirror `git branch -d` (merged into its upstream, else into HEAD) so we never end half-done.
+  upref=$(git -C "$MAIN" rev-parse --verify --quiet "$name@{upstream}") || upref=HEAD
+  git -C "$MAIN" merge-base --is-ancestor "$name" "$upref" 2>/dev/null \
+    || die "gałąź '$name' nie jest zmergowana lokalnie (do upstreamu lub HEAD głównego checkoutu); zrób fetch/pull targetu"
+
+  if [ "$check" = 1 ]; then
+    info "można usunąć: $name"
+    return 0
+  fi
+  git -C "$MAIN" worktree remove "$wpath" || die "git worktree remove nie powiodło się"
+  if ! git -C "$MAIN" branch -d "$name" >/dev/null; then
+    die "worktree usunięty, ale gałąź '$name' nie jest zmergowana lokalnie; sprawdź ją i usuń ręcznie"
+  fi
+  git -C "$MAIN" config --unset "branch.$name.wt-target" 2>/dev/null
+  git -C "$MAIN" config --unset "branch.$name.wt-title" 2>/dev/null
+  info "usunięto worktree i gałąź: $name"
+}
 
 # ----------------------------------------------------------------- main -----
 

@@ -4,11 +4,18 @@
 Launched by `wt ui`. All git work goes through the `wt` script (WT_CMD) or read-only git calls.
 """
 import curses
+import datetime
+import json
+import locale
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import textwrap
+import threading
+import time
 
 WT = os.environ.get("WT_CMD", "wt")
 
@@ -26,8 +33,9 @@ def clean_error(text, fallback):
 def run(cmd, cwd=None, timeout=30):
     """Run a command, return (rc, stdout, stderr)."""
     try:
-        env = dict(os.environ, NO_COLOR="1")
-        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout)
+        env = dict(os.environ, NO_COLOR="1", GH_PROMPT_DISABLED="1", GIT_TERMINAL_PROMPT="0")
+        p = subprocess.run(cmd, cwd=cwd, env=env, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
         return p.returncode, p.stdout, p.stderr
     except (OSError, subprocess.TimeoutExpired) as e:
         return 1, "", str(e)
@@ -72,6 +80,228 @@ def parse_base(text):
     return ""
 
 
+def parse_branch_config(text, key):
+    """Parse `git config --get-regexp` output for branch.<name>.<key> into {branch: value}."""
+    out = {}
+    for line in text.splitlines():
+        m = re.match(r"^branch\.(.+)\.%s (.*)$" % re.escape(key), line)
+        if m and m.group(2).strip():
+            out[m.group(1)] = m.group(2).strip()
+    return out
+
+
+def created_ts(path):
+    """When the worktree was created (epoch seconds): `time` in .wt-owner, else mtime of its .git file."""
+    try:
+        with open(os.path.join(path, ".wt-owner"), encoding="utf-8") as f:
+            t = json.load(f).get("time", "")
+        return datetime.datetime.strptime(t, "%Y-%m-%dT%H:%M:%S%z").timestamp()
+    except (OSError, ValueError, AttributeError):
+        pass
+    try:
+        return os.stat(os.path.join(path, ".git")).st_mtime
+    except OSError:
+        return None
+
+
+def fmt_age(ts, now=None):
+    """Short Polish age: teraz, 5min, 3h, 2d, 4mies, 1r. '?' when unknown."""
+    if ts is None:
+        return "?"
+    sec = max(0, int((time.time() if now is None else now) - ts))
+    if sec < 60:
+        return "teraz"
+    if sec < 3600:
+        return f"{sec // 60}min"
+    if sec < 86400:
+        return f"{sec // 3600}h"
+    days = sec // 86400
+    if days < 60:
+        return f"{days}d"
+    return f"{days // 30}mies" if days < 365 else f"{days // 365}r"
+
+
+def check_bucket(c):
+    """One gh check (CheckRun or StatusContext) as 'red' | 'yellow' | 'green'."""
+    concl = (c.get("conclusion") or "").upper()
+    status = (c.get("status") or "").upper()
+    state = (c.get("state") or "").upper()  # StatusContext entries
+    if concl in ("FAILURE", "TIMED_OUT", "CANCELLED", "STARTUP_FAILURE", "ACTION_REQUIRED") \
+            or state in ("FAILURE", "ERROR"):
+        return "red"
+    if (status and status != "COMPLETED") or state in ("PENDING", "EXPECTED"):
+        return "yellow"
+    return "green"
+
+
+def check_list(checks):
+    """[(name, bucket)] for every dict entry of statusCheckRollup."""
+    return [(str(c.get("name") or c.get("context") or "?"), check_bucket(c))
+            for c in checks or [] if isinstance(c, dict)]
+
+
+def ci_state(checks):
+    """Reduce gh statusCheckRollup to 'green' | 'yellow' | 'red' | 'none'."""
+    buckets = [b for _, b in check_list(checks)]
+    if not buckets:
+        return "none"
+    return "red" if "red" in buckets else "yellow" if "yellow" in buckets else "green"
+
+
+def parse_conflict_files(text):
+    """Files from `git merge-tree --write-tree --name-only`: lines after the tree id, up to a blank line."""
+    lines = text.splitlines()[1:]
+    out = []
+    for ln in lines:
+        if not ln.strip():
+            break
+        out.append(ln.strip())
+    return out
+
+
+def parse_prs(text):
+    """Map `gh pr list --json ...` output to {headRefName: pr}; prefers an open PR, then the newest."""
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return {}
+    out = {}
+    for pr in data if isinstance(data, list) else []:
+        if not isinstance(pr, dict) or not pr.get("headRefName") or not isinstance(pr.get("number"), int):
+            continue
+        item = {"number": pr["number"], "draft": bool(pr.get("isDraft")),
+                "state": (pr.get("state") or "").upper(),
+                "mergeable": (pr.get("mergeable") or "").upper(),
+                "ci": ci_state(pr.get("statusCheckRollup")), "url": pr.get("url") or "",
+                "checks": check_list(pr.get("statusCheckRollup")), "base": pr.get("baseRefName") or ""}
+        old = out.get(pr["headRefName"])
+        if old is None or (item["state"] == "OPEN", item["number"]) > (old["state"] == "OPEN", old["number"]):
+            out[pr["headRefName"]] = item
+    return out
+
+
+PR_FIELDS = "number,headRefName,baseRefName,isDraft,state,mergeable,statusCheckRollup,url"
+
+
+# Help panel content: (key, description), rendered like the Yazi key hints.
+HELP = [("j/k ↑/↓", "ruch"), ("g/G", "góra / dół"), ("PgUp/PgDn", "strona"),
+        ("n", "nowy worktree"), ("t", "testy w worktree"), ("c", "kopiuj cd"),
+        ("p", "push / utwórz PR (draft)"), ("d", "draft <-> ready"), ("m", "merge PR"),
+        ("x", "usuń worktree"), ("M", "merge PR + usuń"),
+        ("r", "odśwież"), ("/", "filtr"), ("Esc", "wyczyść filtr / wyjście"),
+        ("Space", "zamknij skróty"), ("q", "wyjście")]
+
+def display_cmd(argv, wt=None):
+    """Shell-quoted command for the confirmation modal; the wt script path is shown as plain 'wt'."""
+    parts = list(argv)
+    if wt is not None and parts and parts[0] == wt:
+        parts[0] = "wt"
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def merge_block(pr):
+    """(refusal, warning) for merging a PR: refusal is a reason string or None."""
+    if pr["state"] != "OPEN":
+        return "PR #%d nie jest otwarty (%s)." % (pr["number"], pr["state"].lower() or "?"), None
+    if pr["draft"]:
+        return "PR #%d jest draftem. Najpierw oznacz go jako ready (d)." % pr["number"], None
+    if pr["mergeable"] == "CONFLICTING":
+        return "PR #%d ma konflikty z targetem. Rozwiąż je i spróbuj ponownie." % pr["number"], None
+    if pr["mergeable"] != "MERGEABLE":
+        return "GitHub jeszcze liczy, czy PR da się zmergować. Spróbuj za chwilę (r = odśwież).", None
+    if pr["ci"] == "red":
+        return "CI jest czerwone. Napraw testy przed mergem.", None
+    if pr["ci"] == "yellow":
+        return None, "CI jeszcze trwa - GitHub może odrzucić merge."
+    return None, None
+
+
+def plan_action(kind, row, meta, pr, base, pr_status, has_gh, wt="wt"):
+    """Plan a single-worktree action. Pure: returns {"error": str} or {"title", "lines", "steps"}.
+
+    kind: push | ready | merge | drop | mergedrop. Each step is {"argv", "cwd"}.
+    Never forces anything; push and gh live only here, behind an explicit confirmation.
+    """
+    branch, path = row["branch"], row["path"]
+    target = meta.get("target") or base
+    title = meta.get("title") or branch
+    drop_argv = [wt, "drop", branch]
+    if kind == "drop":
+        merged = bool(pr and pr["state"] == "MERGED")
+        steps = [{"argv": drop_argv + (["--merged-pr"] if merged else []), "cwd": None}]
+        lines = ["Usunie worktree i gałąź lokalną '%s'." % branch,
+                 "Odmowa przy zmianach niezacommitowanych, niezmergowanych commitach",
+                 "(chyba że PR jest zmergowany) albo żywym właścicielu."]
+        return {"title": "Usuń worktree", "lines": lines, "steps": steps}
+
+    gh_kinds = ("ready", "merge", "mergedrop")
+    if kind in gh_kinds or kind == "push":
+        if kind in gh_kinds and not has_gh:
+            return {"error": "Brak programu 'gh' w PATH. Zainstaluj GitHub CLI i zaloguj się (gh auth login)."}
+        if has_gh and pr_status != "ok":
+            why = ("PR jeszcze się wczytują, spróbuj za chwilę." if pr_status == "loading" else
+                   "Nie udało się pobrać PR z GitHuba (offline, brak origin albo brak logowania: gh auth login).")
+            return {"error": why}
+
+    if kind == "push":
+        steps = [{"argv": ["git", "push", "-u", "origin", branch], "cwd": path}]
+        lines = ["Wypchnie gałąź '%s' do origin (bez force)." % branch]
+        if has_gh and not (pr and pr["state"] == "OPEN"):
+            if not target:
+                return {"error": "Brak gałęzi docelowej (target) dla PR."}
+            steps.append({"argv": ["gh", "pr", "create", "--draft", "--base", target, "--head", branch,
+                                   "--title", title, "--body", ""], "cwd": path})
+            lines.append("Utworzy PR (draft) '%s' -> '%s'." % (branch, target))
+        elif has_gh:
+            lines.append("PR #%d już istnieje - tylko push." % pr["number"])
+        else:
+            lines.append("Brak 'gh' - tylko push, bez PR.")
+        return {"title": "Push / PR", "lines": lines, "steps": steps}
+
+    if not pr:
+        return {"error": "Ta gałąź nie ma PR. Utwórz go klawiszem p."}
+    num = str(pr["number"])
+    if kind == "ready":
+        if pr["state"] != "OPEN":
+            return {"error": "PR #%s nie jest otwarty (%s)." % (num, pr["state"].lower() or "?")}
+        argv = ["gh", "pr", "ready", num] + ([] if pr["draft"] else ["--undo"])
+        what = "ready (do przeglądu)" if pr["draft"] else "draft"
+        return {"title": "Status PR", "lines": ["Zmieni PR #%s na %s." % (num, what)],
+                "steps": [{"argv": argv, "cwd": path}]}
+
+    refusal, warning = merge_block(pr)
+    if refusal:
+        return {"error": refusal}
+    steps = []
+    lines = []
+    if kind == "mergedrop":
+        steps.append({"argv": drop_argv + ["--merged-pr", "--check"], "cwd": None})
+        lines.append("Najpierw sprawdzi, czy worktree da się usunąć (nic jeszcze nie usuwa).")
+    steps.append({"argv": ["gh", "pr", "merge", num, "--merge"], "cwd": path})
+    lines.append("Zmerguje PR #%s (merge commit, bez usuwania gałęzi zdalnej)." % num)
+    if kind == "mergedrop":
+        steps.append({"argv": drop_argv + ["--merged-pr"], "cwd": None})
+        lines.append("Po sukcesie usunie worktree i gałąź lokalną '%s'." % branch)
+    if warning:
+        lines.append("UWAGA: " + warning)
+    return {"title": "Merge PR + usuń" if kind == "mergedrop" else "Merge PR", "lines": lines, "steps": steps}
+
+
+# key -> action kind (see plan_action)
+ACTION_KEYS = {ord("p"): "push", ord("d"): "ready", ord("m"): "merge", ord("x"): "drop", ord("M"): "mergedrop"}
+
+ITEM_H = 3  # rows per list item: branch + PR/CI, title + conflicts, age + counters
+ITEM_PITCH = ITEM_H + 1  # item rows + one separator row
+MIN_W, MIN_H = 50, 10
+
+
+def trunc(s, n):
+    """Cut s to n cells, marking the cut with an ellipsis (whole characters only)."""
+    if n <= 0:
+        return ""
+    return s if len(s) <= n else s[:n - 1] + "…"
+
+
 class App:
     def __init__(self, scr):
         self.scr = scr
@@ -80,11 +310,153 @@ class App:
         self.base = ""
         self.cursor = 0
         self.top = 0
+        self.body_h = 1
         self.filter = ""
         self.message = ""
         self.pending_error = None
         self.detail_cache = {}
+        self.show_help = False
+        self.cancelled = False
+        self.meta = {}          # branch -> {"title", "target", "created"}
+        self.prs = {}           # branch -> PR info (from gh), filled in the background
+        self.pr_status = "off"  # off (no gh) | loading | ok | err
+        self.pr_gen = 0
+        self.init_style()
         self.reload()
+
+    # ---- style and safe drawing primitives ----
+
+    def init_style(self):
+        """Colors (256-color shades with an 8-color fallback) and box/glyph sets."""
+        enc = (locale.getpreferredencoding(False) or "").lower()
+        self.utf8 = "utf" in enc
+        if self.utf8:
+            self.bx = dict(tl="╭", tr="╮", bl="╰", br="╯", h="─", v="│")
+            self.sym = dict(busy="●", sel="▸", ok="✓", arrow="→", cut="…", up="↑", ci="●", wait="…",
+                            warn="!", dot="·", bar="▌", sep="─")
+        else:
+            self.bx = dict(tl=curses.ACS_ULCORNER, tr=curses.ACS_URCORNER, bl=curses.ACS_LLCORNER,
+                           br=curses.ACS_LRCORNER, h=curses.ACS_HLINE, v=curses.ACS_VLINE)
+            self.sym = dict(busy="*", sel=">", ok="v", arrow="->", cut="~", up="^", ci="o", wait="..",
+                            warn="!", dot="|", bar="|", sep="-")
+        c = dict(plain=0, head=curses.A_BOLD, dim=curses.A_DIM)
+        try:
+            curses.use_default_colors()
+        except curses.error:
+            pass
+        if curses.has_colors():
+            rich = curses.COLORS >= 256
+            # name: (256-color fg, 8-color fg); backgrounds stay default (-1) so the theme shows through
+            spec = {"border": (111, curses.COLOR_BLUE), "accent": (117, curses.COLOR_CYAN),
+                    "green": (114, curses.COLOR_GREEN), "yellow": (222, curses.COLOR_YELLOW),
+                    "red": (211, curses.COLOR_RED), "mag": (183, curses.COLOR_MAGENTA),
+                    "title": (189, curses.COLOR_WHITE)}
+            for i, (name, (fg256, fg8)) in enumerate(spec.items(), start=1):
+                try:
+                    curses.init_pair(i, fg256 if rich else fg8, -1)
+                    c[name] = curses.color_pair(i)
+                except curses.error:
+                    c[name] = 0
+            try:
+                # Selected row: dark text on a colored background (good contrast on any theme).
+                curses.init_pair(20, 235 if rich else curses.COLOR_BLACK,
+                                 117 if rich else curses.COLOR_CYAN)
+                c["sel"] = curses.color_pair(20) | curses.A_BOLD
+            except curses.error:
+                c["sel"] = curses.A_REVERSE
+            if rich:
+                try:
+                    curses.init_pair(21, 245, -1)
+                    c["dim"] = curses.color_pair(21)
+                except curses.error:
+                    pass
+                # Focused list item: same colors on a soft dark-gray background (keeps the theme's pastels readable).
+                shades = {"plain": 252, "dim": 247, "border": 111, "accent": 117, "green": 114,
+                          "yellow": 222, "red": 211, "mag": 183, "title": 189}
+                for j, (name, fg) in enumerate(shades.items()):
+                    try:
+                        curses.init_pair(40 + j, fg, 238)
+                        c["s_" + name] = curses.color_pair(40 + j)
+                    except curses.error:
+                        pass
+        else:
+            c["sel"] = curses.A_REVERSE
+        for name in ("border", "accent", "green", "yellow", "red", "mag", "title"):
+            c.setdefault(name, 0)
+        c["redb"] = c["red"] | curses.A_BOLD
+        c["accentb"] = c["accent"] | curses.A_BOLD
+        c["greenb"] = c["green"] | curses.A_BOLD
+        c["titleb"] = c["title"] | curses.A_BOLD
+        # Focused-row variants: s_<name>; without 256 colors the whole row is simply reversed/highlighted.
+        for name in ("plain", "dim", "border", "accent", "green", "yellow", "red", "mag", "title"):
+            c.setdefault("s_" + name, c["sel"])
+        for name in ("red", "accent", "green", "title"):
+            c["s_" + name + "b"] = c["s_" + name] | curses.A_BOLD
+        self.c = c
+
+    def put(self, y, x, s, attr=0, maxw=None):
+        """Safe addstr: clips to the screen (and maxw), never raises."""
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x >= w or not s:
+            return
+        if x < 0:
+            s, x = s[-x:], 0
+        avail = w - x if maxw is None else min(w - x, maxw)
+        s = s[:max(0, avail)]
+        if not s:
+            return
+        try:
+            self.scr.addstr(y, x, s, attr)
+        except curses.error:
+            pass  # writing the bottom-right cell raises after the char is already drawn
+
+    def put_ch(self, y, x, ch, attr=0):
+        h, w = self.scr.getmaxyx()
+        if y < 0 or y >= h or x < 0 or x >= w:
+            return
+        try:
+            if isinstance(ch, str):
+                self.scr.addstr(y, x, ch, attr)
+            else:
+                self.scr.addch(y, x, ch, attr)
+        except curses.error:
+            pass
+
+    def segs(self, y, x, parts, maxw):
+        """Draw (text, style-name) parts left to right, clipped to maxw cells."""
+        used = 0
+        for text, style in parts:
+            if used >= maxw:
+                break
+            self.put(y, x + used, text, self.c[style], maxw - used)
+            used += len(text)
+
+    def fill(self, y, x, h, w):
+        for i in range(h):
+            self.put(y + i, x, " " * w)
+
+    def box(self, y, x, h, w, style="border", title=None, tstyle="accentb", clear=False):
+        """Rounded box; the title is woven into the top edge: ╭─── Title ───╮."""
+        if h < 2 or w < 2:
+            return
+        if clear:
+            self.fill(y, x, h, w)
+        a, b = self.bx, self.c[style]
+        for i in range(1, w - 1):
+            self.put_ch(y, x + i, a["h"], b)
+            self.put_ch(y + h - 1, x + i, a["h"], b)
+        for i in range(1, h - 1):
+            self.put_ch(y + i, x, a["v"], b)
+            self.put_ch(y + i, x + w - 1, a["v"], b)
+        self.put_ch(y, x, a["tl"], b)
+        self.put_ch(y, x + w - 1, a["tr"], b)
+        self.put_ch(y + h - 1, x, a["bl"], b)
+        self.put_ch(y + h - 1, x + w - 1, a["br"], b)
+        if title and w > 10:
+            t = " " + trunc(title, w - 10) + " "
+            self.put(y, x + 4, t, self.c[tstyle], w - 5)
+
+    # ---- data ----
 
     def reload(self):
         rc, out, err = run([WT, "list", "--porcelain"])
@@ -99,78 +471,177 @@ class App:
         _, cout, cerr = run([WT, "config"])
         self.base = parse_base(cout + cerr)
         self.detail_cache = {}
+        _, tt, _ = run(["git", "config", "--get-regexp", r"^branch\..*\.wt-title$"])
+        _, tg, _ = run(["git", "config", "--get-regexp", r"^branch\..*\.wt-target$"])
+        titles, targets = parse_branch_config(tt, "wt-title"), parse_branch_config(tg, "wt-target")
+        self.meta = {r["branch"]: {"title": titles.get(r["branch"], ""), "target": targets.get(r["branch"], ""),
+                                   "created": created_ts(r["path"])} for r in self.rows}
+        self.start_pr_fetch()
+
+    def start_pr_fetch(self):
+        """Fetch PR/CI data for all branches in one background `gh` call (optional, never blocks)."""
+        if not shutil.which("gh"):
+            self.pr_status = "off"
+            return
+        self.pr_gen += 1
+        gen = self.pr_gen
+        self.pr_status = "loading"
+
+        def work():
+            rc, out, _ = run(["gh", "pr", "list", "--state", "all", "--limit", "100", "--json", PR_FIELDS],
+                             timeout=20)
+            if gen != self.pr_gen:
+                return
+            if rc == 0:
+                self.prs = parse_prs(out)
+                self.pr_status = "ok"
+            else:
+                self.pr_status = "err"  # no network / no remote / not logged in: keep old data silently
+        threading.Thread(target=work, daemon=True).start()
 
     def visible(self):
         if not self.filter:
             return self.rows
         f = self.filter.lower()
-        return [r for r in self.rows if f in r["branch"].lower()]
+        return [r for r in self.rows
+                if f in r["branch"].lower() or f in self.meta.get(r["branch"], {}).get("title", "").lower()]
+
+    # ---- dialogs ----
 
     def confirm(self, question):
         h, w = self.scr.getmaxyx()
-        self.scr.addnstr(h - 1, 0, (question + " [y/n] ").ljust(w - 1), w - 1, curses.A_REVERSE)
+        self.put(h - 1, 0, (question + " [y/n] ").ljust(w - 1), self.c["sel"], w - 1)
         self.scr.refresh()
         return self.scr.getch() in (ord("y"), ord("Y"))
 
     def modal(self, title, text):
-        """Red error box centered on screen; dismissed with Enter, Space or Esc."""
+        """Red rounded error box centered on screen; dismissed with Enter, Space or Esc."""
         scr = self.scr
         while True:
+            self.draw(refresh=False)
             h, w = scr.getmaxyx()
-            box_w = max(20, min(w - 4, 76))
+            box_w = max(12, min(w - 4, 76))
             body = []
             for line in text.splitlines() or [""]:
-                body += textwrap.wrap(line, box_w - 4, subsequent_indent="  ") or [""]
+                body += textwrap.wrap(line, max(1, box_w - 6), subsequent_indent="  ") or [""]
             max_body = max(1, h - 8)
             if len(body) > max_body:
                 body = body[:max_body - 1] + ["..."]
-            box_h = len(body) + 7
+            box_h = len(body) + 5
             y0, x0 = max(0, (h - box_h) // 2), max(0, (w - box_w) // 2)
-            red = curses.color_pair(4)
-            # Red foreground on the default background: same palette slot as the red text wt
-            # prints in the shell, so it matches the terminal theme (white-on-red did not).
-            for y in range(box_h):
-                scr.addnstr(y0 + y, x0, " " * box_w, box_w)
-            scr.attron(red)
-            scr.hline(y0, x0 + 1, curses.ACS_HLINE, box_w - 2)
-            scr.hline(y0 + box_h - 1, x0 + 1, curses.ACS_HLINE, box_w - 2)
-            scr.vline(y0 + 1, x0, curses.ACS_VLINE, box_h - 2)
-            scr.vline(y0 + 1, x0 + box_w - 1, curses.ACS_VLINE, box_h - 2)
-            scr.addch(y0, x0, curses.ACS_ULCORNER)
-            scr.addch(y0, x0 + box_w - 1, curses.ACS_URCORNER)
-            scr.addch(y0 + box_h - 1, x0, curses.ACS_LLCORNER)
-            scr.addch(y0 + box_h - 1, x0 + box_w - 1, curses.ACS_LRCORNER)
-            scr.attroff(red)
-            scr.addnstr(y0 + 1, x0 + 1, (" " + title).ljust(box_w - 2), box_w - 2,
-                        red | curses.A_BOLD | curses.A_REVERSE)
+            # Red foreground on the default background (never white-on-red: unreadable on pastel themes).
+            self.box(y0, x0, box_h, box_w, style="red", title=title, tstyle="redb", clear=True)
             for i, line in enumerate(body):
-                scr.addnstr(y0 + 3 + i, x0 + 2, line, box_w - 4, red)
+                self.put(y0 + 2 + i, x0 + 3, line, 0, box_w - 6)
             label = "[ OK ]"
-            scr.addnstr(y0 + box_h - 2, x0 + (box_w - len(label)) // 2, label, len(label),
-                        red | curses.A_REVERSE | curses.A_BOLD)
+            self.put(y0 + box_h - 2, x0 + max(1, (box_w - len(label)) // 2), label,
+                     self.c["red"] | curses.A_REVERSE | curses.A_BOLD)
             scr.refresh()
             key = scr.getch()
             if key in (10, 13, 27, ord(" "), curses.KEY_ENTER):
                 return
-            if key == curses.KEY_RESIZE:
-                scr.erase()
 
-    def prompt(self, label):
-        h, w = self.scr.getmaxyx()
-        curses.echo()
-        curses.curs_set(1)
-        self.scr.addnstr(h - 1, 0, label.ljust(w - 1), w - 1)
-        self.scr.move(h - 1, len(label))
-        value = self.scr.getstr(h - 1, len(label), 60).decode("utf-8", "replace")
-        curses.noecho()
-        curses.curs_set(0)
-        return value.strip()
+    def confirm_box(self, title, lines, steps):
+        """Confirmation modal: what will happen + exact commands. y/Enter = yes, n/Esc = no."""
+        scr = self.scr
+        while True:
+            self.draw(refresh=False)
+            h, w = scr.getmaxyx()
+            box_w = max(20, min(w - 4, 86))
+            inner = max(1, box_w - 6)
+            body = []
+            for line in lines:
+                body += textwrap.wrap(line, inner) or [""]
+            body.append("")
+            body.append("Komendy:")
+            for st in steps:
+                body += ["  $ " + l if i == 0 else "    " + l for i, l in
+                         enumerate(textwrap.wrap(display_cmd(st["argv"], WT), max(1, inner - 4),
+                                                 break_long_words=True) or [""])]
+            max_body = max(1, h - 8)
+            if len(body) > max_body:
+                body = body[:max_body - 1] + ["..."]
+            box_h = len(body) + 5
+            y0, x0 = max(0, (h - box_h) // 2), max(0, (w - box_w) // 2)
+            self.box(y0, x0, box_h, box_w, style="yellow", title=title, tstyle="accentb", clear=True)
+            for i, line in enumerate(body):
+                self.put(y0 + 2 + i, x0 + 3, line, self.c["dim"] if line.startswith("  ") else 0, box_w - 6)
+            self.put(y0 + box_h - 2, x0 + 3, "[ y / Enter: tak ]   [ n / Esc: nie ]", self.c["accentb"], box_w - 6)
+            scr.refresh()
+            key = scr.getch()
+            if key in (ord("y"), ord("Y"), 10, 13, curses.KEY_ENTER):
+                return True
+            if key in (ord("n"), ord("N"), 27, ord("q")):
+                return False
+
+    def prompt(self, title, initial=""):
+        """Nvim-cmdline style input window; returns the stripped text, "" on Esc (self.cancelled set)."""
+        scr = self.scr
+        buf, pos = list(initial), len(initial)
+        self.cancelled = False
+        while True:
+            self.draw(refresh=False)
+            h, w = scr.getmaxyx()
+            bw = max(12, min(w - 4, 64))
+            x0, y0 = max(0, (w - bw) // 2), max(0, h // 4 - 1)
+            self.box(y0, x0, 3, bw, style="border", title=title, tstyle="accentb", clear=True)
+            avail = max(1, bw - 7)
+            start = 0 if pos < avail else pos - avail + 1
+            self.put(y0 + 1, x0 + 2, ">", self.c["accentb"])
+            self.put(y0 + 1, x0 + 4, "".join(buf[start:start + avail]), 0, avail)
+            under = buf[pos] if pos < len(buf) else " "
+            self.put(y0 + 1, x0 + 4 + pos - start, under, curses.A_REVERSE)
+            scr.refresh()
+            try:
+                ch = scr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                ch = "\x1b"
+            if isinstance(ch, str):
+                if ch in ("\n", "\r"):
+                    return "".join(buf).strip()
+                if ch == "\x1b":
+                    self.cancelled = True
+                    return ""
+                if ch in ("\x7f", "\b"):
+                    if pos:
+                        del buf[pos - 1]
+                        pos -= 1
+                elif ch == "\x01":
+                    pos = 0
+                elif ch == "\x05":
+                    pos = len(buf)
+                elif ch == "\x15":
+                    buf, pos = [], 0
+                elif ch.isprintable() and len(buf) < 200:
+                    buf.insert(pos, ch)
+                    pos += 1
+            elif ch == curses.KEY_BACKSPACE:
+                if pos:
+                    del buf[pos - 1]
+                    pos -= 1
+            elif ch == curses.KEY_DC:
+                if pos < len(buf):
+                    del buf[pos]
+            elif ch == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif ch == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif ch == curses.KEY_HOME:
+                pos = 0
+            elif ch == curses.KEY_END:
+                pos = len(buf)
+            elif ch == curses.KEY_ENTER:
+                return "".join(buf).strip()
+
+    # ---- drawing ----
 
     def details(self, row):
+        """Detail lines as lists of (text, style-name) parts (cached per worktree)."""
         key = row["path"]
         if key in self.detail_cache:
             return self.detail_cache[key]
-        lines = []
         if self.base:
             _, out, _ = run(["git", "-C", row["path"], "log", "--oneline", "-n", "8",
                              f"{self.base}..HEAD"])
@@ -179,87 +650,440 @@ class App:
             commits = []
         _, out, _ = run(["git", "-C", row["path"], "status", "--short"])
         changed = out.strip().splitlines()
-        lines.append((f"commity ponad {self.base or 'bazą'}:", curses.A_BOLD))
-        lines += [("  " + c, 0) for c in commits] or [("  (brak)", curses.A_DIM)]
-        lines.append(("", 0))
-        lines.append(("niezacommitowane:", curses.A_BOLD))
-        lines += [("  " + c, 0) for c in changed[:15]] or [("  (czysto)", curses.A_DIM)]
+        lines = []
+        lines.append([(f"Commity ponad {self.base or 'bazą'}", "accentb")])
+        for cm in commits:
+            sha, _, msg = cm.partition(" ")
+            lines.append([("  " + sha + " ", "yellow"), (msg, "plain")])
+        if not commits:
+            lines.append([("  (brak)", "dim")])
+        lines.append([])
+        lines.append([("Zmiany niezacommitowane", "accentb")])
+        for ch in changed[:15]:
+            code = ch[:2].strip()
+            style = "red" if "D" in code else "green" if code in ("A", "??") else "yellow"
+            lines.append([("  " + ch[:2], style), (ch[2:], "plain")])
+        if not changed:
+            lines.append([("  " + self.sym["ok"] + " czysto", "green")])
         if len(changed) > 15:
-            lines.append((f"  ... i {len(changed) - 15} więcej", curses.A_DIM))
+            lines.append([(f"  ... i {len(changed) - 15} więcej", "dim")])
         self.detail_cache[key] = lines
         return lines
 
-    def draw(self):
+    def pr_badge(self, branch):
+        """(text, style) parts for the PR column: 'PR #50 draft', CI icon; None when gh is unavailable."""
+        pr = self.prs.get(branch)
+        if pr:
+            txt = f"PR #{pr['number']}"
+            if pr["state"] == "MERGED":
+                txt += " merged"
+            elif pr["state"] == "CLOSED":
+                txt += " closed"
+            elif pr["draft"]:
+                txt += " draft"
+            ci = {"green": "green", "yellow": "yellow", "red": "redb", "none": "dim"}[pr["ci"]]
+            icon = self.sym["ci"] if self.utf8 else {"green": "g", "yellow": "y", "red": "r", "none": "-"}[pr["ci"]]
+            if pr["state"] != "OPEN":
+                return [(txt, "dim")]
+            return [(txt + " ", "accent"), (icon, ci)]
+        if self.pr_status == "loading":
+            return [("PR " + self.sym["wait"], "dim")]
+        if self.pr_status == "ok":
+            return [("brak PR", "dim")]
+        return None
+
+    def conflict_notes(self, r):
+        """Conflict warnings: overlap with other worktrees (wt status) and PR conflict with its target."""
+        notes = []
+        others = [o for o, _ in self.collisions.get(r["branch"], [])]
+        if others:
+            notes.append("kolizja: " + ", ".join(others))
+        pr = self.prs.get(r["branch"])
+        if pr and pr["state"] == "OPEN" and pr["mergeable"] == "CONFLICTING":
+            notes.append("konflikt z targetem PR")
+        return notes
+
+    def item_lines(self, r, w):
+        """The three lines of a list item as (left parts, right parts), each a list of (text, style)."""
+        m = self.meta.get(r["branch"], {})
+        busy = r["owner"] != "wolny"
+        dirty = r["dirty"] != "0"
+        notes = self.conflict_notes(r)
+        bstyle = "redb" if notes else "yellow" if dirty else "greenb"
+        l1 = [(self.sym["busy"] if busy else " ", "mag"), (self.sym["warn"] if notes else " ", "redb"),
+              (" " + r["branch"], bstyle)]
+        r1 = self.pr_badge(r["branch"]) or []
+        if m.get("title"):
+            l2 = [("   " + m["title"], "titleb")]
+        elif m.get("target"):
+            l2 = [("   " + self.sym["arrow"] + " " + m["target"], "accent")]
+        else:
+            l2 = [("   (bez tytułu)", "dim")]
+        r2 = [(" ".join(notes), "redb")] if notes else []
+        ahead = r["ahead"] != "0"
+        sep = (" " + self.sym["dot"] + " ", "dim")
+        l3 = [("   utw. " + fmt_age(m.get("created")), "dim"), sep,
+              ("commity +" + r["ahead"], "green" if ahead else "dim"), sep,
+              ("zmiany " + ("~" + r["dirty"] if dirty else "0"), "yellow" if dirty else "dim")]
+        return [(l1, r1), (l2, r2), (l3, [])]
+
+    def draw_list(self, rows, y0, x0, ph, pw):
+        self.box(y0, x0, ph, pw, title="Worktree")
+        iw, ih = pw - 2, ph - 2
+        cap = max(1, (ih + 1) // ITEM_PITCH)
+        if not rows:
+            self.put(y0 + 1, x0 + 2, "brak worktree (n = nowy)", self.c["dim"], iw - 1)
+        for i, r in enumerate(rows[self.top:self.top + cap]):
+            idx = self.top + i
+            y = y0 + 1 + i * ITEM_PITCH
+            selected = idx == self.cursor
+            if i > 0 and y - 1 < y0 + ph - 1:  # thin separator between items
+                self.put(y - 1, x0 + 3, self.sym["sep"] * max(0, iw - 4), self.c["border"] | curses.A_DIM)
+            if selected:
+                for k in range(ITEM_H):
+                    self.put(y + k, x0 + 1, " " * iw, self.c["s_plain"])
+            for k, (left, right) in enumerate(self.item_lines(r, iw)):
+                if y + k >= y0 + ph - 1:
+                    break
+                if selected:
+                    bar = self.sym["bar"] if self.utf8 else (">" if k == 0 else "|")
+                    marker = (bar + " ", "s_accentb")
+                    left = [(t, "s_" + st if "s_" + st in self.c else "s_plain") for t, st in left]
+                    right = [(t, "s_" + st if "s_" + st in self.c else "s_plain") for t, st in right]
+                else:
+                    marker = ("  ", "plain")
+                avail = iw - 1
+                rlen = sum(len(t) for t, _ in right)
+                if rlen > avail // 2:  # keep at least half of the width for the left side
+                    right = [(trunc(right[0][0], avail // 2), right[0][1])] if len(right) == 1 else right
+                    rlen = sum(len(t) for t, _ in right)
+                    if rlen > avail // 2:
+                        right, rlen = [], 0
+                lw = max(1, avail - rlen - (1 if rlen else 0))
+                text = "".join(t for t, _ in left)
+                if len(text) + 2 > lw:  # shorten the last left part with an ellipsis
+                    over = len(text) + 2 - lw
+                    t, st = left[-1]
+                    left = left[:-1] + [(trunc(t, max(1, len(t) - over)), st)]
+                self.segs(y + k, x0 + 1, [marker] + left, avail)
+                if rlen:
+                    self.segs(y + k, x0 + 1 + iw - rlen - 1, right, rlen)
+        if len(rows) > cap:
+            tag = f" {self.cursor + 1}/{len(rows)} "
+            self.put(y0 + ph - 1, x0 + pw - len(tag) - 2, tag, self.c["dim"])
+
+    def conflict_files(self, r, pr):
+        """Files that would conflict when merging the branch into the PR base (cached; needs git >= 2.38)."""
+        key = ("conf", r["branch"], pr["number"])
+        if key in self.detail_cache:
+            return self.detail_cache[key]
+        base = pr.get("base") or self.base
+        files = []
+        if base:
+            ref = f"origin/{base}"
+            rc, _, _ = run(["git", "-C", r["path"], "rev-parse", "--verify", "--quiet", ref])
+            if rc != 0:
+                ref = base
+            rc, out, _ = run(["git", "-C", r["path"], "merge-tree", "--write-tree", "--name-only",
+                              "--no-messages", ref, r["branch"]])
+            if rc == 1:
+                files = parse_conflict_files(out)
+        self.detail_cache[key] = files
+        return files
+
+    def draw_detail(self, rows, y0, x0, ph, pw):
+        r = rows[self.cursor] if rows else None
+        self.box(y0, x0, ph, pw, title="Szczegóły")
+        if not r:
+            return
+        iw = pw - 4
+        m = self.meta.get(r["branch"], {})
+        owner_style = "mag" if r["owner"] != "wolny" else "dim"
+        lab = lambda t: (t.ljust(15), "dim")
+        lines = [[(r["branch"], "greenb")],
+                 [(r["path"] if len(r["path"]) <= iw else "…" + r["path"][-(iw - 1):], "dim")],
+                 []]
+        if m.get("title"):  # worktree title: prominent block between the path and the metadata
+            for ln in textwrap.wrap(m["title"], max(10, iw - 2))[:3]:
+                lines.append([(ln, "titleb")])
+            lines.append([(self.sym["sep"] * min(iw, 40), "border")])
+        lines.append([])
+        if m.get("target"):
+            lines.append([lab("target"), (m["target"], "accent")])
+        created = m.get("created")
+        age = fmt_age(created)
+        lines.append([lab("utworzony"), (age + ("" if age in ("teraz", "?") else " temu"), "plain")])
+        if created:
+            lines.append([lab(""), (time.strftime("%Y-%m-%d %H:%M", time.localtime(created)), "dim")])
+        lines += [[lab("ost. commit"), (r["age"], "plain")],
+                  [lab("commity"), ("+" + r["ahead"] + " ponad bazą", "green" if r["ahead"] != "0" else "dim")],
+                  [lab("zmiany"), (r["dirty"] + " niezacommitowanych" if r["dirty"] != "0" else "brak",
+                                   "yellow" if r["dirty"] != "0" else "dim")],
+                  [lab("właściciel"), (r["owner"], owner_style)]]
+        pr = self.prs.get(r["branch"])
+        if pr:
+            st = {"OPEN": "otwarty", "MERGED": "zmergowany", "CLOSED": "zamknięty"}.get(pr["state"], pr["state"])
+            lines.append([lab("PR"), (f"#{pr['number']} {st}" + (", draft" if pr["draft"] else ""), "accent")])
+            civ = {"green": ("przechodzi", "green"), "yellow": ("trwa", "yellow"),
+                   "red": ("błąd", "redb"), "none": ("brak", "dim")}[pr["ci"]]
+            lines.append([lab("CI"), (self.sym["ci"] + " ", civ[1]), (civ[0], civ[1])])
+            words = {"green": "przechodzi", "yellow": "trwa", "red": "błąd"}
+            for cname, bucket in pr.get("checks", [])[:8]:
+                lines.append([lab(""), (self.sym["ci"] + " ", {"green": "green", "yellow": "yellow", "red": "redb"}[bucket]),
+                              (cname, "plain"), ("  " + words[bucket], "dim")])
+            if len(pr.get("checks", [])) > 8:
+                lines.append([lab(""), (f"... i {len(pr['checks']) - 8} więcej", "dim")])
+            if pr["mergeable"] == "CONFLICTING":
+                lines.append([lab("konflikt z PR"), ("tak - wymaga rozwiązania", "redb")])
+                for cf in self.conflict_files(r, pr)[:8]:
+                    lines.append([lab(""), ("! " + cf, "red")])
+            elif pr["mergeable"] == "MERGEABLE":
+                lines.append([lab("konflikt z PR"), ("brak", "green")])
+            if pr["url"]:
+                lines.append([lab("link"), (pr["url"], "dim")])
+        elif self.pr_status == "loading":
+            lines.append([lab("PR"), ("wczytuję " + self.sym["wait"], "dim")])
+        elif self.pr_status == "ok":
+            lines.append([lab("PR"), ("brak", "dim")])
+        lines.append([])
+        for other, files in self.collisions.get(r["branch"], []):
+            lines.append([("! Kolizja z ", "redb"), (other, "redb")])
+            lines += [[("    " + f, "red")] for f in files[:8]]
+            lines.append([])
+        lines += self.details(r)
+        for i, parts in enumerate(lines[:ph - 2]):
+            self.segs(y0 + 1 + i, x0 + 2, parts, iw)
+
+    def draw_help(self, h, w):
+        """Yazi-like key hint panel docked to the bottom of the screen."""
+        kw = max(len(k) for k, _ in HELP)
+        dw = max(len(d) for _, d in HELP)
+        col_w = kw + 3 + dw + 3
+        ncols = max(1, min(4, (w - 4) // col_w))
+        per = -(-len(HELP) // ncols)
+        ph = min(h - 1, per + 2)
+        y0 = h - ph
+        self.box(y0, 0, ph, w, title="Skróty")
+        for n, (k, d) in enumerate(HELP):
+            col, row = divmod(n, per)
+            if row >= ph - 2:
+                continue
+            x = 2 + col * col_w
+            self.segs(h - ph + 1 + row, x, [(k.rjust(kw), "greenb"), (" " + self.sym["arrow"] + " ", "dim"),
+                                           (d, "plain")], max(0, w - 2 - x))
+
+    def draw(self, refresh=True):
         scr = self.scr
         scr.erase()
         h, w = scr.getmaxyx()
+        if w < MIN_W or h < MIN_H:
+            self.put(h // 2, max(0, (w - 12) // 2), "okno za małe", self.c["redb"])
+            self.put(h // 2 + 1, max(0, (w - 11) // 2), "q = wyjście", self.c["dim"])
+            if refresh:
+                scr.refresh()
+            return
         rows = self.visible()
         self.cursor = max(0, min(self.cursor, len(rows) - 1))
-        body_h = h - 3
+        ph = h - 3
+        self.body_h = body_h = max(1, (ph - 1) // ITEM_PITCH)
         if self.cursor < self.top:
             self.top = self.cursor
         elif self.cursor >= self.top + body_h:
             self.top = self.cursor - body_h + 1
-        left_w = max(34, w * 40 // 100)
+        self.top = max(0, min(self.top, max(0, len(rows) - body_h)))
+        left_w = min(max(36, w * 9 // 20), w - 20)
 
-        header = " wt  |  worktree: %d" % len(rows)
+        parts = [(" wt ", "accentb"), ("│ ", "border"), (f"worktree: {len(rows)}", "plain")]
         if self.base:
-            header += f"  |  baza: {self.base}"
+            parts += [("  │ ", "border"), ("baza: ", "dim"), (self.base, "greenb")]
         if self.filter:
-            header += f"  |  filtr: {self.filter}"
-        scr.addnstr(0, 0, header.ljust(w - 1), w - 1, curses.A_REVERSE | curses.A_BOLD)
+            parts += [("  │ ", "border"), ("filtr: ", "dim"), (self.filter, "yellow")]
+        self.segs(0, 0, parts, w - 1)
 
-        if not rows:
-            scr.addnstr(2, 2, "brak worktree (n = nowy)", w - 3, curses.A_DIM)
-        for i, r in enumerate(rows[self.top:self.top + body_h]):
-            idx = self.top + i
-            attr = curses.A_REVERSE if idx == self.cursor else 0
-            coll = "!" if r["branch"] in self.collisions else " "
-            busy = "●" if r["owner"] != "wolny" else " "
-            dirty = f"~{r['dirty']}" if r["dirty"] != "0" else "  "
-            text = f" {busy}{coll} {r['branch']}  +{r['ahead']} {dirty}"
-            if r["branch"] in self.collisions:
-                attr |= curses.color_pair(2)
-            elif r["dirty"] != "0":
-                attr |= curses.color_pair(3)
-            scr.addnstr(1 + i, 0, text.ljust(left_w - 1), left_w - 1, attr)
+        self.draw_list(rows, 1, 0, ph, left_w)
+        self.draw_detail(rows, 1, left_w, ph, w - left_w)
 
-        for y in range(1, h - 2):
-            scr.addch(y, left_w, curses.ACS_VLINE)
+        if self.show_help:
+            self.draw_help(h, w)
+        else:
+            msg = self.message
+            style = "redb" if msg.startswith("!") else "green" if msg.startswith("+") else "dim"
+            self.put(h - 2, 1, msg, self.c[style], w - 2)
+            self.segs(h - 1, 1, [("<Space>", "accentb"), (" skróty  ", "dim"), ("q", "accentb"),
+                                 (" wyjście", "dim")], w - 2)
+        if refresh:
+            scr.refresh()
 
-        right_x, right_w = left_w + 2, w - left_w - 3
-        if rows and right_w > 10:
-            r = rows[self.cursor]
-            lines = [(r["branch"], curses.A_BOLD), (r["path"], curses.A_DIM),
-                     (f"wiek: {r['age']}   ahead: {r['ahead']}   brudne: {r['dirty']}", 0),
-                     (f"właściciel: {r['owner']}", curses.color_pair(3) if r["owner"] != "wolny" else 0),
-                     ("", 0)]
-            for other, files in self.collisions.get(r["branch"], []):
-                lines.append((f"KOLIZJA z {other}:", curses.color_pair(2) | curses.A_BOLD))
-                lines += [("  " + f, curses.color_pair(2)) for f in files[:8]]
-                lines.append(("", 0))
-            lines += self.details(r)
-            y = 1
-            for text, attr in lines:
-                for chunk in textwrap.wrap(text, right_w, drop_whitespace=False,
-                                           subsequent_indent="    ") or [""]:
-                    if y >= h - 2:
-                        break
-                    scr.addnstr(y, right_x, chunk, right_w, attr)
-                    y += 1
+    # ---- actions ----
 
-        scr.addnstr(h - 2, 0, (" " + self.message).ljust(w - 1), w - 1, curses.A_DIM)
-        keys = " j/k ↑↓ ruch  g/G góra/dół  n nowy  t testy  c kopiuj cd  r odśwież  / filtr  q wyjście"
-        scr.addnstr(h - 1, 0, keys.ljust(w - 1), w - 1, curses.A_REVERSE)
-        scr.refresh()
+    def local_branches(self):
+        """Local branch names (for the target dropdown), base first."""
+        _, out, _ = run(["git", "for-each-ref", "--format=%(refname:short)", "refs/heads"])
+        names = [b for b in out.split() if b]
+        if self.base in names:
+            names.remove(self.base)
+            names.insert(0, self.base)
+        return names
+
+    def pick(self, title, items, current):
+        """Popup list under the form; returns the chosen index (or current on Esc)."""
+        scr, idx = self.scr, current
+        while True:
+            self.draw(refresh=False)
+            self.form_draw()
+            h, w = scr.getmaxyx()
+            n = min(len(items), max(1, h - 8))
+            bw = max(12, min(w - 8, 40))
+            x0, y0 = max(0, (w - bw) // 2), self.form_y + 3
+            top = max(0, min(idx - n + 1, len(items) - n)) if idx >= n else 0
+            self.box(y0, x0, n + 2, bw, title=title, clear=True)
+            for i in range(n):
+                it = items[top + i]
+                sel = top + i == idx
+                self.put(y0 + 1 + i, x0 + 1, (" " + it).ljust(bw - 2), self.c["sel"] if sel else 0, bw - 2)
+            scr.refresh()
+            try:
+                ch = scr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                return current
+            if ch in ("\n", "\r", " ", curses.KEY_ENTER):
+                return idx
+            if ch == "\x1b":
+                return current
+            if ch in ("k", curses.KEY_UP):
+                idx = max(0, idx - 1)
+            elif ch in ("j", curses.KEY_DOWN):
+                idx = min(len(items) - 1, idx + 1)
+
+    def form_draw(self):
+        """Draw the new-worktree form from self.form (state dict)."""
+        f = self.form
+        scr = self.scr
+        h, w = scr.getmaxyx()
+        bw = max(30, min(w - 4, 64))
+        x0, y0 = max(0, (w - bw) // 2), max(0, h // 4 - 1)
+        self.form_y = y0
+        self.box(y0, x0, 7, bw, title="Nowy worktree", clear=True)
+        labels = ("Target", "Nazwa", "Tytuł")
+        avail = max(1, bw - 15)
+        for i, lab in enumerate(labels):
+            y = y0 + 1 + i
+            foc = f["focus"] == i
+            self.put(y, x0 + 2, lab.ljust(7), self.c["accentb"] if foc else self.c["dim"])
+            if i == 0:
+                txt = f["branches"][f["target"]] if f["branches"] else "(brak gałęzi)"
+                self.put(y, x0 + 10, "[ " + trunc(txt, avail - 4) + " ▾ ]" if self.utf8 else
+                         "[ " + trunc(txt, avail - 4) + " v ]",
+                         self.c["sel"] if foc else self.c["border"], avail)
+            else:
+                buf, pos = f["buf"][i], f["pos"][i]
+                start = 0 if pos < avail else pos - avail + 1
+                self.put(y, x0 + 10, ">", self.c["accentb"] if foc else self.c["dim"])
+                shown = "".join(buf[start:start + avail - 2])
+                if not buf and not foc and i == 2:
+                    self.put(y, x0 + 12, "(opcjonalny)", self.c["dim"])
+                else:
+                    self.put(y, x0 + 12, shown, 0, avail - 2)
+                if foc:
+                    under = buf[pos] if pos < len(buf) else " "
+                    self.put(y, x0 + 12 + pos - start, under, curses.A_REVERSE)
+        self.put(y0 + 5, x0 + 2, "Tab/↑↓ pole   Enter dalej/utwórz   Esc anuluj" if self.utf8 else
+                 "Tab/up/down field  Enter next/create  Esc cancel", self.c["dim"], bw - 4)
+
+    def new_form(self):
+        """Modal form: target branch dropdown + name + optional title. Returns (name, target, title) or None."""
+        scr = self.scr
+        branches = self.local_branches()
+        self.form = f = dict(focus=1, branches=branches, target=0,
+                             buf={1: [], 2: []}, pos={1: 0, 2: 0})
+        while True:
+            self.draw(refresh=False)
+            self.form_draw()
+            scr.refresh()
+            try:
+                ch = scr.get_wch()
+            except curses.error:
+                continue
+            except KeyboardInterrupt:
+                return None
+            foc = f["focus"]
+            if ch == "\x1b":
+                return None
+            if ch in ("\t", curses.KEY_DOWN):
+                f["focus"] = (foc + 1) % 3
+                continue
+            if ch in (curses.KEY_BTAB, curses.KEY_UP):
+                f["focus"] = (foc - 1) % 3
+                continue
+            if foc == 0:
+                if ch in ("\n", "\r", " ", curses.KEY_ENTER) and branches:
+                    f["target"] = self.pick("Target branch", branches, f["target"])
+                elif ch in ("j", curses.KEY_RIGHT, "l") and branches:
+                    f["target"] = (f["target"] + 1) % len(branches)
+                elif ch in ("k", curses.KEY_LEFT, "h") and branches:
+                    f["target"] = (f["target"] - 1) % len(branches)
+                continue
+            buf, pos = f["buf"][foc], f["pos"][foc]
+            if isinstance(ch, str):
+                if ch in ("\n", "\r"):
+                    if foc == 1 and not buf:
+                        continue
+                    if foc == 1:
+                        f["focus"] = 2
+                        continue
+                    if not f["buf"][1]:
+                        f["focus"] = 1
+                        continue
+                    return ("".join(f["buf"][1]).strip(), branches[f["target"]] if branches else "",
+                            "".join(f["buf"][2]).strip())
+                if ch in ("\x7f", "\b"):
+                    if pos:
+                        del buf[pos - 1]
+                        pos -= 1
+                elif ch == "\x01":
+                    pos = 0
+                elif ch == "\x05":
+                    pos = len(buf)
+                elif ch == "\x15":
+                    buf.clear()
+                    pos = 0
+                elif ch.isprintable() and len(buf) < 200:
+                    buf.insert(pos, ch)
+                    pos += 1
+            elif ch == curses.KEY_BACKSPACE:
+                if pos:
+                    del buf[pos - 1]
+                    pos -= 1
+            elif ch == curses.KEY_DC:
+                if pos < len(buf):
+                    del buf[pos]
+            elif ch == curses.KEY_LEFT:
+                pos = max(0, pos - 1)
+            elif ch == curses.KEY_RIGHT:
+                pos = min(len(buf), pos + 1)
+            elif ch == curses.KEY_HOME:
+                pos = 0
+            elif ch == curses.KEY_END:
+                pos = len(buf)
+            elif ch == curses.KEY_ENTER:
+                f["focus"] = 2 if foc == 1 else foc
+            f["pos"][foc] = pos
 
     def new(self):
-        name = self.prompt("Nazwa nowego worktree: ")
-        if not name:
+        res = self.new_form()
+        if not res or not res[0]:
             return
+        name, target, title = res
         self.message = f"tworzę {name}..."
         self.draw()
-        rc, out, err = run([WT, "new", name], timeout=120)
+        cmd = [WT, "new", name]
+        if target:
+            cmd += ["--target", target]
+        if title:
+            cmd += ["--title", title]
+        rc, out, err = run(cmd, timeout=120)
         self.reload()
         if rc == 0:
             for i, r in enumerate(self.visible()):
@@ -286,6 +1110,48 @@ class App:
         self.reload()
         self.message = "testy: OK" if rc == 0 else f"testy: kod wyjścia {rc}"
 
+    def run_steps(self, steps, label):
+        """Run steps in a background thread with a spinner; returns None or (step, error text)."""
+        res = {"done": False, "fail": None}
+
+        def work():
+            for st in steps:
+                rc, out, err = run(st["argv"], cwd=st.get("cwd"), timeout=120)
+                if rc != 0:
+                    res["fail"] = (st, clean_error(err or out, "polecenie zwróciło błąd"))
+                    break
+            res["done"] = True
+        threading.Thread(target=work, daemon=True).start()
+        frames, i = "-\\|/", 0
+        while not res["done"]:
+            self.message = f"{frames[i % 4]} {label}..."
+            self.draw()
+            self.scr.timeout(100)
+            self.scr.getch()  # keys pressed meanwhile are discarded
+            i += 1
+        self.scr.timeout(-1)
+        return res["fail"]
+
+    def act(self, kind, row):
+        """Plan, confirm, run and report one action on the focused worktree."""
+        plan = plan_action(kind, row, self.meta.get(row["branch"], {}), self.prs.get(row["branch"]),
+                           self.base, self.pr_status, bool(shutil.which("gh")), WT)
+        if plan.get("error"):
+            self.message = "! " + plan["error"].splitlines()[0]
+            self.modal("Nie można wykonać", plan["error"])
+            return
+        if not self.confirm_box(plan["title"], plan["lines"], plan["steps"]):
+            self.message = "anulowano"
+            return
+        fail = self.run_steps(plan["steps"], plan["title"])
+        self.reload()  # also re-reads PR state from GitHub (source of truth)
+        if fail:
+            st, text = fail
+            self.message = f"! {plan['title']} nie powiodło się"
+            self.modal(f"{plan['title']}: błąd", f"$ {display_cmd(st['argv'], WT)}\n{text}")
+        else:
+            self.message = f"+ {plan['title']}: gotowe"
+
     def copy_cd(self, row):
         cmd = f"cd {row['path']}"
         try:
@@ -296,11 +1162,10 @@ class App:
             self.modal("Schowek niedostępny", f"Brak pbcopy. Wpisz ręcznie:\n{cmd}")
 
     def loop(self):
-        curses.curs_set(0)
-        curses.use_default_colors()
-        curses.init_pair(2, curses.COLOR_RED, -1)
-        curses.init_pair(3, curses.COLOR_YELLOW, -1)
-        curses.init_pair(4, curses.COLOR_RED, -1)
+        try:
+            curses.curs_set(0)
+        except curses.error:
+            pass
         while True:
             if self.pending_error:
                 title, text = self.pending_error
@@ -308,11 +1173,20 @@ class App:
                 self.draw()
                 self.modal(title, text)
             self.draw()
+            self.scr.timeout(250 if self.pr_status == "loading" else -1)
             key = self.scr.getch()
+            self.scr.timeout(-1)
+            if key == curses.KEY_RESIZE or key == -1:
+                continue
             rows = self.visible()
+            self.cursor = max(0, min(self.cursor, len(rows) - 1))
             row = rows[self.cursor] if rows else None
-            page = max(1, self.scr.getmaxyx()[0] - 3)
-            if key in (ord("q"), 27):
+            page = self.body_h
+            if self.show_help and key in (ord(" "), 27):
+                self.show_help = False
+            elif key == ord(" "):
+                self.show_help = True
+            elif key in (ord("q"), 27):
                 if self.filter and key == 27:
                     self.filter = ""
                     continue
@@ -333,20 +1207,28 @@ class App:
                 self.reload()
                 self.message = "odświeżono"
             elif key == ord("/"):
-                self.filter = self.prompt("Filtr (pusty = wyczyść): ")
-                self.cursor = 0
+                value = self.prompt("Filtr (pusty = wyczyść)", self.filter)
+                if not self.cancelled:
+                    self.filter = value
+                    self.cursor = 0
             elif key == ord("n"):
                 self.new()
             elif key == ord("t") and row:
                 self.run_tests(row)
             elif key == ord("c") and row:
                 self.copy_cd(row)
+            elif row and key in ACTION_KEYS:
+                self.act(ACTION_KEYS[key], row)
 
 
 def main():
     rc, _, err = run([WT, "list", "--porcelain"])
     if rc != 0:
         sys.exit(err.strip() or "wt: nie udało się odczytać listy worktree")
+    try:
+        locale.setlocale(locale.LC_ALL, "")
+    except locale.Error:
+        pass
     os.environ.setdefault("ESCDELAY", "25")
     curses.wrapper(lambda scr: App(scr).loop())
 
