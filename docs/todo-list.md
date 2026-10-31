@@ -56,3 +56,9 @@ Dla kazdego nowoutworzonego worktree
 Komenda wt poza repo
 [ ] - wpisanie samej komendy wt ma nam wyswietlic ui zamiast help, a help ma nam sie wyswietlic po wpisaniu flagi -h lub --help - DO SPRAWDZENIA
 [ ] - po wpisaniu wt poza repo ma byc mozliwosc wyswietlenia projektow wt dla juz utworzonych repozytoriow - DO SPRAWDZENIA
+
+TEST CI
+
+- unit jest czerwony, gdy nazwa gałęzi PR zawiera fail, np. wt new fail-demo.
+- e2e jest czerwony, gdy tytuł PR zawiera [flaky].
+- lint jest zawsze zielony.
