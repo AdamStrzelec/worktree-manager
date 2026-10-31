@@ -141,13 +141,17 @@ base_branch() {
   BASE=$b
 }
 
-# resolve_wt_root - WT_DIR relative to MAIN (or absolute), normalized.
-resolve_wt_root() {
-  local d=$CFG_WT_DIR
-  case "$d" in
-    /*) WT_ROOT=$(norm_path "$d") ;;
-    *)  WT_ROOT=$(norm_path "$MAIN/$d") ;;
+# wt_dir_abs DIR - DIR relative to MAIN (or absolute), normalized.
+wt_dir_abs() {
+  case "$1" in
+    /*) norm_path "$1" ;;
+    *)  norm_path "$MAIN/$1" ;;
   esac
+}
+
+# resolve_wt_root - WT_ROOT from the effective WT_DIR.
+resolve_wt_root() {
+  WT_ROOT=$(wt_dir_abs "$CFG_WT_DIR")
 }
 
 # norm_path ABS - lexical normalization (collapse ., .., //); path need not exist.
@@ -237,7 +241,7 @@ usage() {
     printf '  merge <temat>           testy, rebase, testy, merge --ff-only\n'
     printf '  drop <temat>            usuń worktree i gałąź (tylko gdy bezpieczne)\n'
     printf '  ui                      interfejs w terminalu (curses)\n'
-    printf '  config [--porcelain]    efektywna konfiguracja i jej źródła\n\n'
+    printf '  config [set|unset|--porcelain] konfiguracja i jej źródła\n\n'
     printf 'Repo: %s\n' "${repo:-(poza repo git)}"
   } >&2
   exit 1
@@ -251,14 +255,172 @@ repo_main_quiet() {
   printf '%s' "${common%/.git}"
 }
 
+# cfg_known_key KEY - dies unless KEY is a configurable key.
+cfg_known_key() {
+  case " $ALL_KEYS " in
+    *" $1 "*) ;;
+    *) die "nieznany klucz: $1 (dostępne: $ALL_KEYS)" ;;
+  esac
+}
+
+# cfg_validate KEY VALUE - dies when VALUE is unusable for KEY (needs MAIN and loaded config).
+cfg_validate() {
+  local key=$1 val=$2 f root probe wpath line
+  case "$val" in
+    *$'\n'*|*$'\r'*) die "wartość nie może zawierać nowej linii" ;;
+  esac
+  case "$key" in
+    WT_BASE)
+      [ -z "$val" ] || git -C "$MAIN" rev-parse --verify --quiet "refs/heads/$val" >/dev/null \
+        || die "gałąź '$val' nie istnieje" ;;
+    WT_FETCH)
+      case "$val" in 0|1) ;; *) die "WT_FETCH przyjmuje 0 albo 1" ;; esac ;;
+    WT_LINK)
+      for f in $val; do
+        case "$f" in
+          /*|..|../*|*/..|*/../*) die "WT_LINK: '$f' musi być ścieżką względną bez .." ;;
+        esac
+      done ;;
+    WT_DIR)
+      [ -n "$val" ] || die "WT_DIR nie może być puste (przywróć domyślną: wt config unset WT_DIR)"
+      case "$val" in "~"*) die "WT_DIR: '~' nie jest rozwijane, podaj ścieżkę absolutną" ;; esac
+      root=$(wt_dir_abs "$val")
+      [ "$root" != / ] || die "WT_DIR nie może być katalogiem głównym /"
+      case "$MAIN/" in "$root"/*) die "WT_DIR ($root) nie może być głównym checkoutem ani jego katalogiem nadrzędnym" ;; esac
+      case "$root/" in "$MAIN/.git/"*) die "WT_DIR ($root) nie może leżeć w .git" ;; esac
+      while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+          "worktree "*)
+            wpath=${line#worktree }
+            [ "$wpath" = "$MAIN" ] && continue
+            case "$root/" in "$wpath/"*) die "WT_DIR ($root) leży wewnątrz worktree $wpath" ;; esac ;;
+        esac
+      done < <(git -C "$MAIN" worktree list --porcelain)
+      [ ! -e "$root" ] || [ -d "$root" ] || die "WT_DIR ($root) istnieje i nie jest katalogiem"
+      probe=$root
+      while [ ! -e "$probe" ] && [ "$probe" != / ]; do
+        probe=${probe%/*}
+        [ -n "$probe" ] || probe=/
+      done
+      [ -d "$probe" ] && [ -w "$probe" ] || die "WT_DIR: nie można utworzyć $root (brak zapisu w $probe)" ;;
+  esac
+}
+
+# cfg_quote VALUE - parse_conf strips one pair of surrounding quotes, so a value that
+# itself starts and ends with a quote is wrapped in the other kind to survive the round trip.
+cfg_quote() {
+  case "$1" in
+    \"*\") printf "'%s'" "$1" ;;
+    \'*\') printf '"%s"' "$1" ;;
+    *)     printf '%s' "$1" ;;
+  esac
+}
+
+# cfg_rewrite MODE KEY [LINE] - rewrite .git/wt.conf atomically (tmp + mv). MODE=set replaces the
+# first KEY line (dropping repeats) or appends LINE; MODE=unset drops every KEY line.
+# Comments and other lines are kept as they are. Sets CFG_CHANGED=1|0.
+cfg_rewrite() {
+  local mode=$1 key=$2 newline=${3-} file="$MAIN/.git/wt.conf" tmp line k written=0
+  tmp=$(mktemp "$MAIN/.git/wt.conf.XXXXXX") || die "nie mogę utworzyć pliku tymczasowego w $MAIN/.git"
+  if [ -f "$file" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      k=""
+      case "$line" in
+        ''|'#'*) ;;
+        *=*) k=${line%%=*}; k=${k//[[:space:]]/} ;;
+      esac
+      if [ "$k" = "$key" ]; then
+        if [ "$mode" = set ] && [ "$written" = 0 ]; then
+          printf '%s\n' "$newline" >> "$tmp"
+          written=1
+        fi
+        continue
+      fi
+      printf '%s\n' "$line" >> "$tmp"
+    done < "$file"
+  fi
+  if [ "$mode" = set ] && [ "$written" = 0 ]; then
+    printf '%s\n' "$newline" >> "$tmp"
+  fi
+  if { [ -f "$file" ] && cmp -s "$tmp" "$file"; } || { [ "$mode" = unset ] && [ ! -f "$file" ]; }; then
+    rm -f "$tmp"
+    CFG_CHANGED=0
+    return 0
+  fi
+  mv -f "$tmp" "$file" || { rm -f "$tmp"; die "nie mogę zapisać $file"; }
+  CFG_CHANGED=1
+}
+
+# cfg_other_worktrees - number of linked worktrees (without the main checkout).
+cfg_other_worktrees() {
+  local n
+  n=$(git -C "$MAIN" worktree list --porcelain | grep -c '^worktree ')
+  printf '%s' $((n - 1))
+}
+
+# cfg_set_cmd KEY VALUE - wt config set: write to the private .git/wt.conf only.
+cfg_set_cmd() {
+  [ $# -eq 2 ] || die "użycie: wt config set KLUCZ WARTOSC (pustą wartość podaj jako \"\")"
+  local key=$1 val=$2 eff src old_root="" others
+  cfg_known_key "$key"
+  repo_main
+  load_config
+  cfg_validate "$key" "$val"
+  if [ "$key" = WT_DIR ]; then resolve_wt_root; old_root=$WT_ROOT; fi
+  cfg_rewrite set "$key" "$key=$(cfg_quote "$val")"
+  if [ "$CFG_CHANGED" = 1 ]; then
+    info "ustawiono $key w .git/wt.conf"
+  else
+    info "bez zmian: $key już ma tę wartość w .git/wt.conf"
+  fi
+  load_config
+  eval "src=\$SRC_$key"
+  eval "eff=\$CFG_$key"
+  if [ "$src" != "repo (.git/wt.conf)" ]; then
+    info "uwaga: $key jest nadal przesłonięte przez: $src (wartość: ${eff:-(puste)})" >&2
+  fi
+  if [ "$key" = WT_DIR ] && [ "$CFG_CHANGED" = 1 ]; then
+    resolve_wt_root
+    others=$(cfg_other_worktrees)
+    if [ "$WT_ROOT" != "$old_root" ] && [ "$others" -gt 0 ]; then
+      info "uwaga: istniejące worktree ($others) zostają w starym miejscu ($old_root); nowe powstaną w $WT_ROOT" >&2
+    fi
+  fi
+}
+
+# cfg_unset_cmd KEY - wt config unset: drop KEY from .git/wt.conf (back to the next source).
+cfg_unset_cmd() {
+  [ $# -eq 1 ] || die "użycie: wt config unset KLUCZ"
+  local key=$1 eff src
+  cfg_known_key "$key"
+  repo_main
+  cfg_rewrite unset "$key"
+  if [ "$CFG_CHANGED" = 1 ]; then
+    info "usunięto $key z .git/wt.conf"
+  else
+    info "brak $key w .git/wt.conf, nic do usunięcia"
+  fi
+  load_config
+  eval "src=\$SRC_$key"
+  eval "eff=\$CFG_$key"
+  info "obecnie: $key=${eff:-(puste)} (źródło: $src)"
+}
+
 cmd_config() {
   local key val src def porcelain=0
   case "${1:-}" in
+    set)   shift; cfg_set_cmd "$@"; return ;;
+    unset) shift; cfg_unset_cmd "$@"; return ;;
     --porcelain) porcelain=1 ;;
     "") ;;
-    *) die "nieznana opcja: $1 (użycie: wt config [--porcelain])" ;;
+    *) die "nieznana opcja: $1 (użycie: wt config [--porcelain | set KLUCZ WARTOSC | unset KLUCZ])" ;;
   esac
-  init_repo
+  # Not init_repo: a wrong WT_BASE must not stop the command you need to fix it with.
+  repo_main
+  load_config
+  BASE=$(base_branch 2>/dev/null && printf '%s' "$BASE")
+  [ -n "$BASE" ] || BASE="(nieprawidłowa: $CFG_WT_BASE)"
+  resolve_wt_root
   if [ "$porcelain" = 1 ]; then
     # key<TAB>source<TAB>value<TAB>default; tabs inside values become spaces to keep TSV intact.
     for key in $ALL_KEYS; do

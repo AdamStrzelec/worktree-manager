@@ -407,6 +407,65 @@ case "$out" in *evil*) bad "config --porcelain: WT_POST_NEW z .wt.conf ma być z
 rm -f .git/wt.conf .wt.conf
 check_fail "config: nieznana opcja" $WT config --bogus
 
+# wt config set / unset: private .git/wt.conf only, atomic, comments kept
+echo "-- config set/unset"
+rm -f .git/wt.conf .wt.conf
+cval() { $WT config --porcelain 2>/dev/null | awk -F'\t' -v k="$1" '$1 == k {print $3}'; }
+csrc() { $WT config --porcelain 2>/dev/null | awk -F'\t' -v k="$1" '$1 == k {print $2}'; }
+$WT config set WT_POST_NEW 'npm install' >/dev/null 2>&1
+[ "$(cval WT_POST_NEW)" = "npm install" ] && ok "set: wartość widoczna w config" || bad "set: wartość ($(cval WT_POST_NEW))"
+[ "$(csrc WT_POST_NEW)" = "repo (.git/wt.conf)" ] && ok "set: źródło .git/wt.conf" || bad "set: źródło"
+[ ! -e .wt.conf ] && ok "set: nie tworzy wspólnego .wt.conf" || bad "set: powstał .wt.conf"
+printf '# moj komentarz\nWT_FETCH=0\nWT_DIR=../a\nWT_DIR=../b\n\n# koniec\n' > .git/wt.conf
+$WT config set WT_DIR ../c-wt >/dev/null 2>&1
+[ "$(grep -c '^WT_DIR=' .git/wt.conf)" = 1 ] && ok "set: duplikaty klucza zwinięte do jednej linii" || bad "set: duplikaty"
+[ "$(cval WT_DIR)" = "../c-wt" ] && ok "set: nowa wartość" || bad "set: WT_DIR ($(cval WT_DIR))"
+grep -q '^# moj komentarz$' .git/wt.conf && grep -q '^# koniec$' .git/wt.conf && grep -q '^WT_FETCH=0$' .git/wt.conf \
+  && ok "set: komentarze i inne klucze zachowane" || bad "set: zgubione linie"
+out=$($WT config set WT_DIR ../c-wt 2>&1); contains "set: ta sama wartość = bez zmian" "$out" "bez zmian"
+$WT config set WT_TEST '"cytat"' >/dev/null 2>&1
+[ "$(cval WT_TEST)" = '"cytat"' ] && ok "set: wartość w cudzysłowach przeżywa zapis i odczyt" || bad "set: cudzysłowy ($(cval WT_TEST))"
+$WT config set WT_TEST '' >/dev/null 2>&1
+[ -z "$(cval WT_TEST)" ] && [ "$(csrc WT_TEST)" = "repo (.git/wt.conf)" ] && ok "set: pusta wartość" || bad "set: pusta wartość"
+$WT config unset WT_DIR >/dev/null 2>&1
+[ "$(cval WT_DIR)" = ".claude/worktrees" ] && [ "$(csrc WT_DIR)" = "domyślna" ] && ok "unset: wraca do domyślnej" || bad "unset: nie wróciło ($(cval WT_DIR))"
+grep -q '^# moj komentarz$' .git/wt.conf && ok "unset: komentarze zachowane" || bad "unset: zgubiony komentarz"
+out=$($WT config unset WT_DIR 2>&1); contains "unset: brak klucza = nic do usunięcia" "$out" "nic do usunięcia"
+rm -f .git/wt.conf
+out=$($WT config unset WT_DIR 2>&1); contains "unset: brak pliku = nic do usunięcia" "$out" "nic do usunięcia"
+[ ! -e .git/wt.conf ] && ok "unset: nie tworzy pliku" || bad "unset: utworzył plik"
+ls .git/wt.conf.* >/dev/null 2>&1 && bad "pliki tymczasowe zostały" || ok "brak plików tymczasowych po zapisie"
+check_fail "set: nieznany klucz" $WT config set WT_NOPE x
+check_fail "unset: nieznany klucz" $WT config unset WT_NOPE
+check_fail "set: brak wartości" $WT config set WT_DIR
+check_fail "set: wartość z nową linią" $WT config set WT_TEST "$(printf 'a\nb')"
+check_fail "set: WT_FETCH=2" $WT config set WT_FETCH 2
+check_fail "set: WT_BASE nieistniejąca" $WT config set WT_BASE nie-ma-takiej
+check "set: WT_BASE istniejąca" $WT config set WT_BASE main
+check "set: WT_BASE pusta" $WT config set WT_BASE ""
+check_fail "set: WT_LINK z .." $WT config set WT_LINK "../x"
+check_fail "set: WT_LINK absolutna" $WT config set WT_LINK "/etc/passwd"
+check "set: WT_LINK poprawna" $WT config set WT_LINK ".env .env.local"
+check_fail "set: WT_DIR puste" $WT config set WT_DIR ""
+check_fail "set: WT_DIR z ~" $WT config set WT_DIR "~/wt"
+check_fail "set: WT_DIR = główny checkout" $WT config set WT_DIR "."
+check_fail "set: WT_DIR = katalog nadrzędny checkoutu" $WT config set WT_DIR ".."
+check_fail "set: WT_DIR = /" $WT config set WT_DIR "/"
+check_fail "set: WT_DIR w .git" $WT config set WT_DIR ".git/wt-x"
+$WT new cfg-w1 --no-fetch >/dev/null 2>&1
+check_fail "set: WT_DIR wewnątrz istniejącego worktree" $WT config set WT_DIR ".claude/worktrees/cfg-w1/sub"
+out=$($WT config set WT_DIR ../cfg-moved 2>&1); contains "set WT_DIR: ostrzeżenie o starych worktree" "$out" "zostają w starym miejscu"
+[ -d .claude/worktrees/cfg-w1 ] && ok "set WT_DIR: istniejące worktree nietknięte" || bad "set WT_DIR: ruszył worktree"
+rm -f .git/wt.conf
+$WT drop cfg-w1 >/dev/null 2>&1
+out=$(WT_DIR=/tmp/env-wt $WT config set WT_DIR ../zz 2>&1); contains "set: ostrzeżenie, gdy env przesłania" "$out" "przesłonięte przez: env"
+rm -f .git/wt.conf
+printf 'WT_BASE=nie-ma-takiej\n' > .git/wt.conf
+out=$($WT config 2>&1); rc=$?
+[ "$rc" = 0 ] && contains "config z błędną WT_BASE nadal działa" "$out" "WT_BASE" || bad "config z błędną WT_BASE: rc=$rc"
+check "set naprawia błędną WT_BASE" $WT config set WT_BASE main
+rm -f .git/wt.conf
+
 cd "$R" || exit 1
 # shellcheck disable=SC2086
 rm -rf $FC
