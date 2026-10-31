@@ -394,6 +394,19 @@ CONFIG_HELP = {
     "WT_POST_DROP": ("Komenda po udanym usunięciu worktree (te same zmienne). Błąd tylko ostrzega.", False),
 }
 
+# Per key: one-line summary for the OPIS column and example values for the detail pane.
+CONFIG_BRIEF = {
+    "WT_DIR": ("gdzie leżą worktree", [".claude/worktrees", "../moje-repo-worktrees", "/Users/ja/wts/repo"]),
+    "WT_BASE": ("gałąź bazowa", ["main", "develop"]),
+    "WT_LINK": ("symlinki z głównego checkoutu", [".env .venv", ".env node_modules"]),
+    "WT_COPY": ("kopie z głównego checkoutu", [".env.local", ".env.local config/local.json"]),
+    "WT_FETCH": ("fetch przed `wt new` (1/0)", ["1", "0"]),
+    "WT_TEST": ("komenda testów", ["npm test", "pytest -q"]),
+    "WT_POST_NEW": ("komenda po `wt new`", ["npm install", "npm install && npx cap sync ios"]),
+    "WT_PRE_DROP": ("komenda przed `wt drop` (weto)", ["test -z \"$(git -C \"$WT_PATH\" status --porcelain)\""]),
+    "WT_POST_DROP": ("komenda po `wt drop`", ["tmux kill-session -t \"$WT_NAME\" 2>/dev/null; true"]),
+}
+
 
 def parse_config(text):
     """Parse `wt config --porcelain` (key, source, value, default; tab-separated) into dicts."""
@@ -1458,7 +1471,15 @@ class App:
         iw = w - 4
         kw = max(len(i["key"]) for i in items)
         sw = min(24, max(len(i["source"]) for i in items))
-        self.segs(1, 2, [("KLUCZ".ljust(kw + 2), "dim"), ("ŹRÓDŁO".ljust(sw + 2), "dim"), ("WARTOŚĆ", "dim")], iw)
+        # VALUE gets a bounded column so the description column fits; no description on narrow terminals.
+        vw = min(22, max(7, max(len(i["value"] or "(puste)") for i in items)))
+        dw = iw - 2 - (kw + 2) - (sw + 2) - (vw + 2)
+        head = [("KLUCZ".ljust(kw + 2), "dim"), ("ŹRÓDŁO".ljust(sw + 2), "dim")]
+        if dw >= 14:
+            head += [("WARTOŚĆ".ljust(vw + 2), "dim"), ("OPIS", "dim")]
+        else:
+            head += [("WARTOŚĆ", "dim")]
+        self.segs(1, 2, head, iw)
         for n, it in enumerate(items):
             y = 2 + n
             if y >= h - 2:
@@ -1470,9 +1491,14 @@ class App:
             if sel:
                 self.put(y, 1, " " * (w - 2), self.c["s_plain"])
             bar = self.sym["bar"] if sel else " "
-            self.segs(y, 1, [(bar + " ", st("accentb")), (it["key"].ljust(kw + 2), st("plain")),
-                             (trunc(it["source"], sw).ljust(sw + 2), st(src_style)),
-                             (it["value"] or "(puste)", st(val_style))], w - 2)
+            row = [(bar + " ", st("accentb")), (it["key"].ljust(kw + 2), st("plain")),
+                   (trunc(it["source"], sw).ljust(sw + 2), st(src_style))]
+            if dw >= 14:
+                brief = CONFIG_BRIEF.get(it["key"], ("", []))[0]
+                row += [(trunc(it["value"] or "(puste)", vw).ljust(vw + 2), st(val_style)), (trunc(brief, dw), st("dim"))]
+            else:
+                row += [(it["value"] or "(puste)", st(val_style))]
+            self.segs(y, 1, row, w - 2)
         it = items[cur]
         desc, hints = config_notes(it)
         y = 3 + len(items)
@@ -1482,7 +1508,11 @@ class App:
             lines = [(l, "plain") for l in textwrap.wrap(desc, max(10, iw))]
             lines += [("", "plain"), ("Wartość:   " + (it["value"] or "(puste)"), "plain"),
                       ("Domyślna:  " + (it["default"] or "(puste)"), "plain"),
-                      ("Źródło:    " + it["source"], "plain"), ("", "plain")]
+                      ("Źródło:    " + it["source"], "plain")]
+            ex = CONFIG_BRIEF.get(it["key"], ("", []))[1]
+            if ex:
+                lines += [("Przykłady:  " + "   |   ".join(ex), "accent")]
+            lines += [("", "plain")]
             for text, style in hints:
                 lines += [(l, style) for l in textwrap.wrap(text, max(10, iw))]
             for text, style in lines:

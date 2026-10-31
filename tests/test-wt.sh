@@ -639,6 +639,7 @@ assert m.conf_problems("# c\nWT_DIR=x\n  WT_FETCH = 0\n\nWT_FTCH=1\nbez-rownosci
 assert m.conf_problems("") == []
 print("KEYS:" + " ".join(sorted(m.CONFIG_HELP)))
 print("SAFE:" + " ".join(sorted(k for k, (_, ok) in m.CONFIG_HELP.items() if ok)))
+assert set(m.CONFIG_BRIEF) == set(m.CONFIG_HELP) and all(b and ex for b, ex in m.CONFIG_BRIEF.values())
 print("AKCJE-OK")
 PY
 )
