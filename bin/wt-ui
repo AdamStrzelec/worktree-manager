@@ -208,7 +208,7 @@ PR_FIELDS = "number,headRefName,baseRefName,isDraft,state,mergeable,statusCheckR
 # Space menu: categories rendered as columns, (key, description) per entry. A description ending
 # in the arrow glyph opens a submenu. PR_MENU is the submenu opened with "p".
 MENU = [
-    ("Wybrane worktree", [("t", "testy"), ("c", "kopiuj cd"), ("p", "opcje PR >"), ("x", "usuń worktree")]),
+    ("Wybrane worktree", [("t", "testy"), ("c", "kopiuj cd"), ("o", "otwórz >"), ("p", "opcje PR >"), ("x", "usuń worktree")]),
     ("Nawigacja", [("j/k ↑/↓", "ruch (k na górze = nagłówek)"), ("gg/G", "góra / dół"), ("PgUp/PgDn", "strona")]),
     ("Widok", [("/", "filtr"), ("r", "odśwież"), ("Esc", "wyczyść filtr")]),
     ("Ogólne", [("n", "nowy worktree"), ("C", "konfiguracja"), ("Space", "zamknij menu"), ("q", "wyjście")]),
@@ -218,6 +218,7 @@ PR_MENU = [
     ("M", "merge PR + usuń worktree i gałąź lokalną"), ("c", "zamknij PR (close)"),
     ("h/Esc", "wstecz"),
 ]
+OPEN_MENU = [("c", "VS Code"), ("b", "PR w przeglądarce"), ("t", "sesja tmux"), ("h/Esc", "wstecz")]  # submenu opened with "o"
 
 def display_cmd(argv, wt=None):
     """Shell-quoted command for the confirmation modal; the wt script path is shown as plain 'wt'."""
@@ -371,6 +372,24 @@ def pr_menu_state(row, pr, pr_status, has_gh):
 
 # key -> action kind (see plan_action)
 ACTION_KEYS = {ord("x"): "drop"}  # direct keys on the focused worktree
+def open_menu_state(row, pr, pr_status, has_gh):
+    """Availability of the Open submenu keys: {key: None | (short, full)}; None = enabled. Pure."""
+    # tmux: placeholder until `wt new` creates a tmux session per worktree.
+    st = {"c": None, "t": ("wkrótce", "Otwieranie w tmux jeszcze nie działa: wt new nie tworzy jeszcze sesji tmux dla worktree.")}
+    if not row or not row.get("branch"):
+        st["b"] = ("brak gałęzi", "Ten wiersz nie ma gałęzi, więc nie ma też PR.")
+    elif not has_gh:
+        st["b"] = ("brak gh", "Brak programu 'gh' w PATH. Zainstaluj GitHub CLI i zaloguj się (gh auth login).")
+    elif pr_status != "ok":
+        st["b"] = (("PR się wczytują", "PR jeszcze się wczytują, spróbuj za chwilę.") if pr_status == "loading" else
+                   ("brak połączenia z GitHub", "Nie udało się pobrać PR z GitHuba (offline, brak origin albo brak logowania: gh auth login)."))
+    elif not pr or not pr.get("url"):
+        st["b"] = ("brak PR", "Ta gałąź nie ma PR. Najpierw utwórz go (Space, p, p).")
+    else:
+        st["b"] = None
+    return st
+
+
 PR_KEYS = {ord("p"): "push", ord("d"): "ready", ord("m"): "merge", ord("M"): "mergedrop", ord("c"): "close"}  # PR submenu
 
 HDR_H = 3  # header block: padding row, content row, padding row
@@ -1109,7 +1128,21 @@ class App:
             st = self.pr_state(row)
             entries = [(k, d, st[k]) if k in st and st[k] else (k, d) for k, d in PR_MENU]
             return [("Opcje PR", entries)]
+        if self.menu == "open":
+            st = self.open_state(self.open_target())
+            return [("Otwórz", [(k, d, st[k]) if st.get(k) else (k, d) for k, d in OPEN_MENU])]
         return MENU
+
+    def open_target(self):
+        """Row the Open submenu acts on: the focused worktree, or the main repo on the header."""
+        rows = self.visible()
+        if self.on_header:
+            return self.main
+        return rows[min(self.cursor, len(rows) - 1)] if rows else None
+
+    def open_state(self, row):
+        pr = self.prs.get(row["branch"]) if row and row.get("branch") else None
+        return open_menu_state(row, pr, self.pr_status, bool(shutil.which("gh")))
 
     def pr_state(self, row):
         return pr_menu_state(row, self.prs.get(row["branch"]), self.pr_status, bool(shutil.which("gh")))
@@ -1132,7 +1165,7 @@ class App:
             cur.append(i)
             used += cw
         bands.append(cur)
-        note = textwrap.wrap(self.menu_note, max(10, w - 6))[:2] if self.menu == "pr" and self.menu_note else []
+        note = textwrap.wrap(self.menu_note, max(10, w - 6))[:2] if self.menu in ("pr", "open") and self.menu_note else []
         need = len(note) + sum(1 + max(len(cols[i][1]) for i in band) + (1 if n else 0) for n, band in enumerate(bands))
         ph = min(h - 1, need + 2)
         y0 = h - ph
@@ -1140,7 +1173,7 @@ class App:
         for i in range(ph):
             self.put(y0 + i, 0, " " * (w - 1), black)
             self.put_ch(y0 + i, w - 1, " ", black)
-        self.box(y0, 0, ph, w, style="m_border", title="Menu" if self.menu == "main" else "Menu / PR", tstyle="m_accentb")
+        self.box(y0, 0, ph, w, style="m_border", title={"pr": "Menu / PR", "open": "Menu / Otwórz"}.get(self.menu, "Menu"), tstyle="m_accentb")
         y = y0 + 1
         for n, band in enumerate(bands):
             if n:
@@ -1463,6 +1496,37 @@ class App:
             self.message = "! brak pbcopy"
             self.modal("Schowek niedostępny", f"Brak pbcopy. Wpisz ręcznie:\n{cmd}")
 
+    def open_vscode(self, row):
+        """Open the worktree in VS Code: `code` CLI if on PATH, else macOS `open -a`. Detached."""
+        path = row["path"]
+        if shutil.which("code"):
+            argv = ["code", path]
+        elif shutil.which("open"):
+            argv = ["open", "-a", "Visual Studio Code", path]
+        else:
+            self.message = "! brak polecenia code (VS Code: Shell Command: Install 'code')"
+            return
+        try:
+            p = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.PIPE, text=True, timeout=15)
+            self.message = (f"VS Code: {path}" if p.returncode == 0
+                            else "! VS Code: " + (p.stderr.strip().splitlines() or ["błąd"])[-1])
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.message = f"! nie udało się otworzyć VS Code: {e}"
+
+    def open_pr_browser(self, row):
+        """Open the row's PR page in the default browser via macOS `open`."""
+        pr = self.prs.get(row.get("branch") or "")
+        if not pr or not pr["url"]:
+            self.message = "! brak PR dla tej gałęzi (Space, p, p tworzy draft)"
+            return
+        try:
+            p = subprocess.run(["open", pr["url"]], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL, timeout=15)
+            self.message = f"przeglądarka: PR #{pr['number']}" if p.returncode == 0 else "! open zwrócił błąd"
+        except (OSError, subprocess.TimeoutExpired) as e:
+            self.message = f"! nie udało się otworzyć przeglądarki: {e}"
+
     def config_load(self):
         """Fetch the effective config: (items, error-text)."""
         rc, out, err = run([WT, "config", "--porcelain"])
@@ -1675,6 +1739,27 @@ class App:
                     self.menu = "main"
                     self.act(PR_KEYS[key], row)
                 continue
+            if self.show_help and self.menu == "open":
+                target = row or (self.main if self.on_header else None)
+                self.menu_note = ""
+                blocked = self.open_state(target).get(chr(key)) if target and 0 < key < 256 else None
+                if blocked:  # disabled entry: stay in the menu and say why
+                    self.menu_note = blocked[1]
+                    continue
+                if key in (ord("h"), 27, curses.KEY_BACKSPACE, 127, 8):
+                    self.menu = "main"
+                elif key == ord(" "):
+                    self.show_help = False
+                    self.menu = "main"
+                elif key == ord("c") and target:
+                    self.show_help = False
+                    self.menu = "main"
+                    self.open_vscode({"path": target["path"]})
+                elif key == ord("b") and target:
+                    self.show_help = False
+                    self.menu = "main"
+                    self.open_pr_browser(target)
+                continue
             if key == ord("g") and not self.pending_g:
                 self.pending_g = True
                 continue
@@ -1736,6 +1821,9 @@ class App:
                 self.copy_cd(row)
             elif key == ord("c") and self.on_header and self.main:
                 self.copy_cd({"path": self.main["path"]})
+            elif key == ord("o") and (row or (self.on_header and self.main)):
+                self.show_help = True
+                self.menu = "open"
             elif row and key in ACTION_KEYS:
                 self.show_help = False
                 self.act(ACTION_KEYS[key], row)
