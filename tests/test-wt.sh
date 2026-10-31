@@ -105,6 +105,19 @@ out=$($WT new feat-postfail 2>&1); rc=$?
 check "worktree zostaje po błędzie post_new" test -d .claude/worktrees/feat-postfail
 rm .git/wt.conf
 
+echo "-- new: WT_COPY"
+printf 'SECRET=1\n' > .env.local
+mkdir -p cfgdir && printf 'a\n' > cfgdir/x.txt
+printf 'WT_COPY=.env.local cfgdir .brak\n' > .git/wt.conf
+check "copy: new" $WT new feat-copy
+[ -f .claude/worktrees/feat-copy/.env.local ] && [ ! -L .claude/worktrees/feat-copy/.env.local ] && ok "copy: zwykły plik, nie symlink" || bad "copy: plik"
+check "copy: katalog skopiowany" test -f .claude/worktrees/feat-copy/cfgdir/x.txt
+printf 'ZMIENIONE\n' >> .claude/worktrees/feat-copy/.env.local
+[ "$(cat .env.local)" = "SECRET=1" ] && ok "copy: kopia niezależna od oryginału" || bad "copy: oryginał zmieniony"
+check "copy: brakujący plik pomijany" test ! -e .claude/worktrees/feat-copy/.brak
+case "$(git -C .claude/worktrees/feat-copy status --short)" in *env.local*) bad "copy: plik widoczny w git status" ;; *) ok "copy: plik w exclude (git status czysty)" ;; esac
+rm -rf cfgdir .env.local .git/wt.conf
+
 echo "-- list"
 out=$($WT list 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "list exit 0" || bad "list exit $rc"
@@ -391,9 +404,9 @@ check_fail "sama flaga bez nazwy" $WT new --no-fetch
 
 # wt config --porcelain: key<TAB>source<TAB>value<TAB>default, one row per key, order of ALL_KEYS
 out=$($WT config --porcelain 2>&1)
-[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 6 ] && ok "config --porcelain: 6 wierszy" || bad "config --porcelain: liczba wierszy ($out)"
+[ "$(printf '%s\n' "$out" | wc -l | tr -d ' ')" = 7 ] && ok "config --porcelain: 7 wierszy" || bad "config --porcelain: liczba wierszy ($out)"
 [ "$(printf '%s\n' "$out" | head -n1 | awk -F'\t' '{print NF}')" = 4 ] && ok "config --porcelain: 4 pola" || bad "config --porcelain: liczba pól"
-[ "$(printf '%s\n' "$out" | awk -F'\t' '{print $1}' | tr '\n' ' ')" = "WT_DIR WT_BASE WT_LINK WT_FETCH WT_TEST WT_POST_NEW " ] && ok "config --porcelain: kolejność kluczy" || bad "config --porcelain: kolejność kluczy"
+[ "$(printf '%s\n' "$out" | awk -F'\t' '{print $1}' | tr '\n' ' ')" = "WT_DIR WT_BASE WT_LINK WT_COPY WT_FETCH WT_TEST WT_POST_NEW " ] && ok "config --porcelain: kolejność kluczy" || bad "config --porcelain: kolejność kluczy"
 contains "config --porcelain: domyślna WT_DIR" "$out" "$(printf 'WT_DIR\tdomyślna\t.claude/worktrees\t.claude/worktrees')"
 contains "config --porcelain: puste pole bez (puste)" "$out" "$(printf 'WT_BASE\tdomyślna\t\t')"
 printf 'WT_DIR=../x-wt\nWT_TEST=echo a\tb\n' > .git/wt.conf
@@ -642,7 +655,7 @@ def rd(): return open(conf).read() if os.path.exists(conf) else ""
 def key(b, t=0.8): os.write(fd, b); pump(t)
 res = []
 pump(1.5)
-key(b"C"); key(b"jjj", 0.3)                                  # WT_FETCH
+key(b"C"); key(b"jjjj", 0.3)                                 # WT_FETCH
 key(b"\r"); key(b"\x7f0\r", 1.2); res.append(("set", rd() == "WT_FETCH=0\n"))
 key(b"\r"); buf = b""; key(b"\x7f2\r", 1.2)
 res.append(("error-modal", "przyjmuje 0 albo 1" in txt() and rd() == "WT_FETCH=0\n"))

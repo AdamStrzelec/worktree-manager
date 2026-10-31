@@ -386,6 +386,7 @@ CONFIG_HELP = {
     "WT_DIR": ("Katalog, w którym powstają nowe worktree (względny od głównego checkoutu albo absolutny).", True),
     "WT_BASE": ("Gałąź bazowa. Puste = autodetekcja (main, potem master, potem bieżąca gałąź).", True),
     "WT_LINK": ("Pliki symlinkowane z głównego checkoutu do nowego worktree (nieśledzone, np. .env).", True),
+    "WT_COPY": ("Pliki KOPIOWANE z głównego checkoutu do nowego worktree (niezależna kopia, np. .env.local; istniejących nie nadpisuje).", True),
     "WT_FETCH": ("1 = przed `wt new` pobierz zmiany (fetch + ff-only), 0 = wyłącz.", True),
     "WT_TEST": ("Komenda testów dla `wt test`. Puste = plik .wt-test albo autodetekcja.", False),
     "WT_POST_NEW": ("Komenda uruchamiana w nowym worktree po `wt new` (synchronicznie).", False),

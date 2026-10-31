@@ -25,8 +25,8 @@ info() {
 
 # Keys a repo-tracked .wt.conf may set. Everything else needs a trusted source
 # (.git/wt.conf, global config, env) because WT_TEST / WT_POST_NEW run commands.
-SAFE_KEYS=" WT_DIR WT_BASE WT_LINK WT_FETCH "
-ALL_KEYS="WT_DIR WT_BASE WT_LINK WT_FETCH WT_TEST WT_POST_NEW"
+SAFE_KEYS=" WT_DIR WT_BASE WT_LINK WT_COPY WT_FETCH "
+ALL_KEYS="WT_DIR WT_BASE WT_LINK WT_COPY WT_FETCH WT_TEST WT_POST_NEW"
 
 # Seconds before a hung `git fetch` (network, auth prompt) is abandoned; env override for tests.
 FETCH_TIMEOUT=${WT_FETCH_TIMEOUT:-20}
@@ -36,13 +36,14 @@ case "$FETCH_TIMEOUT" in ''|*[!0-9]*) FETCH_TIMEOUT=20 ;; esac
 DEFAULT_WT_DIR=".claude/worktrees"
 DEFAULT_WT_BASE=""
 DEFAULT_WT_LINK=".env .venv"
+DEFAULT_WT_COPY=""
 DEFAULT_WT_FETCH="1"
 DEFAULT_WT_TEST=""
 DEFAULT_WT_POST_NEW=""
 
 # Effective values and their origin, filled by load_config.
-CFG_WT_DIR="" CFG_WT_BASE="" CFG_WT_LINK="" CFG_WT_FETCH="" CFG_WT_TEST="" CFG_WT_POST_NEW=""
-SRC_WT_DIR="" SRC_WT_BASE="" SRC_WT_LINK="" SRC_WT_FETCH="" SRC_WT_TEST="" SRC_WT_POST_NEW=""
+CFG_WT_DIR="" CFG_WT_BASE="" CFG_WT_LINK="" CFG_WT_COPY="" CFG_WT_FETCH="" CFG_WT_TEST="" CFG_WT_POST_NEW=""
+SRC_WT_DIR="" SRC_WT_BASE="" SRC_WT_LINK="" SRC_WT_COPY="" SRC_WT_FETCH="" SRC_WT_TEST="" SRC_WT_POST_NEW=""
 
 # set_cfg KEY VALUE SOURCE - assign without eval (value stays plain text).
 set_cfg() {
@@ -50,6 +51,7 @@ set_cfg() {
     WT_DIR)      CFG_WT_DIR=$2;      SRC_WT_DIR=$3 ;;
     WT_BASE)     CFG_WT_BASE=$2;     SRC_WT_BASE=$3 ;;
     WT_LINK)     CFG_WT_LINK=$2;     SRC_WT_LINK=$3 ;;
+    WT_COPY)     CFG_WT_COPY=$2;     SRC_WT_COPY=$3 ;;
     WT_FETCH)    CFG_WT_FETCH=$2;    SRC_WT_FETCH=$3 ;;
     WT_TEST)     CFG_WT_TEST=$2;     SRC_WT_TEST=$3 ;;
     WT_POST_NEW) CFG_WT_POST_NEW=$2; SRC_WT_POST_NEW=$3 ;;
@@ -275,10 +277,10 @@ cfg_validate() {
         || die "gałąź '$val' nie istnieje" ;;
     WT_FETCH)
       case "$val" in 0|1) ;; *) die "WT_FETCH przyjmuje 0 albo 1" ;; esac ;;
-    WT_LINK)
+    WT_LINK|WT_COPY)
       for f in $val; do
         case "$f" in
-          /*|..|../*|*/..|*/../*) die "WT_LINK: '$f' musi być ścieżką względną bez .." ;;
+          /*|..|../*|*/..|*/../*) die "$key: '$f' musi być ścieżką względną bez .." ;;
         esac
       done ;;
     WT_DIR)
@@ -577,6 +579,18 @@ cmd_new() {
         mkdir -p "$(dirname "$path/$f")"
         ln -s "$MAIN/$f" "$path/$f"
         # A symlink is not matched by dir-only ignore patterns (e.g. "node_modules/").
+        add_exclude "/$f"
+      fi
+    fi
+  done
+
+  for f in $CFG_WT_COPY; do
+    if [ -e "$MAIN/$f" ]; then
+      if [ -e "$path/$f" ] || [ -L "$path/$f" ]; then
+        info "pomijam kopię $f (już istnieje w worktree)"
+      else
+        mkdir -p "$(dirname "$path/$f")"
+        cp -R "$MAIN/$f" "$path/$f"
         add_exclude "/$f"
       fi
     fi
