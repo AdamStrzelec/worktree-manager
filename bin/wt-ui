@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Terminal UI for wt: browse worktrees, see details and collisions, create and test.
+"""Terminal UI for wt: browse worktrees, see details and merge conflicts, create and test.
 
 Launched by `wt ui`. All git work goes through the `wt` script (WT_CMD) or read-only git calls.
 """
@@ -52,25 +52,6 @@ def parse_list(text):
         rows.append({"path": path, "branch": branch, "age": age,
                      "ahead": ahead, "dirty": dirty, "owner": owner})
     return rows
-
-
-def parse_collisions(text):
-    """Parse `wt status` stderr into {branch: [(other_branch, [files])]}."""
-    result = {}
-    current = None
-    for line in text.splitlines():
-        m = re.match(r"^KOLIZJA (.+) ↔ (.+):$", line)
-        if m:
-            a, b = m.group(1), m.group(2)
-            files = []
-            result.setdefault(a, []).append((b, files))
-            result.setdefault(b, []).append((a, files))
-            current = files
-        elif line.startswith("  ") and current is not None:
-            current.append(line.strip())
-        else:
-            current = None
-    return result
 
 
 def parse_base(text):
@@ -547,7 +528,6 @@ class App:
     def __init__(self, scr):
         self.scr = scr
         self.rows = []
-        self.collisions = {}
         self.base = ""
         self.cursor = 0
         self.on_header = False  # focus on the header (main checkout) instead of the list
@@ -741,7 +721,6 @@ class App:
         if rc != 0:
             return {"error": clean_error(err, "wt list nie powiodło się")}
         rows = parse_list(out)
-        _, sout, serr = run([WT, "status"])
         _, cout, cerr = run([WT, "config"])
         _, tt, _ = run(["git", "config", "--get-regexp", r"^branch\..*\.wt-title$"])
         _, tg, _ = run(["git", "config", "--get-regexp", r"^branch\..*\.wt-target$"])
@@ -752,7 +731,7 @@ class App:
         common = os.path.join(main["path"], ".git") if main else None
         gitdirs = [worktree_gitdir(p) for p in [r["path"] for r in rows] + ([main["path"]] if main else [])]
         watched = watch_paths(common, gitdirs)
-        return {"rows": rows, "collisions": parse_collisions(serr + sout), "base": parse_base(cout + cerr),
+        return {"rows": rows, "base": parse_base(cout + cerr),
                 "meta": meta, "main": main, "watched": watched, "fp": fingerprint(watched)}
 
     def apply(self, snap, silent=False):
@@ -765,7 +744,7 @@ class App:
             return
         rows = self.visible()
         cur = rows[self.cursor]["path"] if rows and 0 <= self.cursor < len(rows) else None
-        self.rows, self.collisions, self.base = snap["rows"], snap["collisions"], snap["base"]
+        self.rows, self.base = snap["rows"], snap["base"]
         self.meta, self.main = snap["meta"], snap["main"]
         self.watched, self.last_fp = snap["watched"], snap["fp"]
         self.detail_cache = {}
@@ -1085,11 +1064,11 @@ class App:
         return None
 
     def conflict_notes(self, r):
-        """Conflict warnings: overlap with other worktrees (wt status) and PR conflict with its target."""
+        """Conflict warnings, only when merging would actually fail: open PR that conflicts with its target.
+
+        Overlapping files between worktrees (wt status) are deliberately not shown: they are only
+        potential conflicts and most of them merge cleanly."""
         notes = []
-        others = [o for o, _ in self.collisions.get(r["branch"], [])]
-        if others:
-            notes.append("kolizja: " + ", ".join(others))
         pr = self.prs.get(r["branch"])
         if pr and pr["state"] == "OPEN" and pr["mergeable"] == "CONFLICTING":
             notes.append("konflikt z targetem PR")
@@ -1238,10 +1217,6 @@ class App:
         elif self.pr_status == "ok":
             lines.append([lab("PR"), ("brak", "dim")])
         lines.append([])
-        for other, files in self.collisions.get(r["branch"], []):
-            lines.append([("! Kolizja z ", "redb"), (other, "redb")])
-            lines += [[("    " + f, "red")] for f in files[:8]]
-            lines.append([])
         lines += self.details(r)
         for i, parts in enumerate(lines[:ph - 2]):
             self.segs(y0 + 1 + i, x0 + 2, parts, iw)

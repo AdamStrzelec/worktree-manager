@@ -222,8 +222,6 @@ spec = importlib.util.spec_from_loader("wt_ui", loader)
 m = importlib.util.module_from_spec(spec); loader.exec_module(m)
 rows = m.parse_list("/p/a\tfeat-a\t2 hours ago\t3\t1\tzajęty (pid 5, %1)\nśmieci\n")
 assert len(rows) == 1 and rows[0]["branch"] == "feat-a" and rows[0]["owner"].startswith("zajęty"), rows
-c = m.parse_collisions("KOLIZJA a ↔ b:\n  x.txt\n  y/z.txt\nbrak\n")
-assert c["a"][0][0] == "b" and c["b"][0][0] == "a" and c["a"][0][1] == ["x.txt", "y/z.txt"], c
 assert m.parse_base("repo:  /r\nbaza:  main\n") == "main"
 import json, tempfile, os, time
 assert m.parse_branch_config("branch.feat.x.wt-title Moj task\nbranch.b.wt-title \n", "wt-title") == {"feat.x": "Moj task"}
