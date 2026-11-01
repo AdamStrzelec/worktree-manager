@@ -210,7 +210,7 @@ PR_FIELDS = "number,headRefName,baseRefName,isDraft,state,mergeable,statusCheckR
 MENU = [
     ("Wybrane worktree", [("t", "testy"), ("c", "kopiuj >"), ("o", "otwórz >"), ("p", "opcje PR >"), ("x", "usuń worktree")]),
     ("Nawigacja", [("j/k ↑/↓", "ruch (k na górze = nagłówek)"), ("gg/G", "góra / dół"), ("PgUp/PgDn", "strona")]),
-    ("Widok", [("/", "filtr"), ("r", "odśwież"), ("Esc", "wyczyść filtr")]),
+    ("Widok", [("/", "filtr"), ("r", "odśwież + fetch"), ("U", "pobierz zmiany do main (ff-only)"), ("Esc", "wyczyść filtr")]),
     ("Ogólne", [("n", "nowy worktree"), ("C", "konfiguracja"), ("Space", "zamknij menu"), ("q", "wyjście")]),
 ]
 PR_MENU = [
@@ -521,6 +521,8 @@ class App:
         self.prs = {}           # branch -> PR info (from gh), filled in the background
         self.pr_status = "off"  # off (no gh) | loading | ok | err
         self.pr_gen = 0
+        self.fetch_status = "off"  # off | loading | ok | err (background `git fetch origin`)
+        self.fetch_gen = 0
         self.init_style()
         self.reload()
 
@@ -694,6 +696,52 @@ class App:
                                    "created": created_ts(r["path"])} for r in self.rows}
         self.main = load_main_info()
         self.start_pr_fetch()
+        self.start_remote_fetch()
+
+    def start_remote_fetch(self):
+        """`git fetch origin` in the background so behind/ahead reflect the real remote (never blocks)."""
+        if not self.main:
+            return
+        self.fetch_gen += 1
+        gen = self.fetch_gen
+        self.fetch_status = "loading"
+        path = self.main["path"]
+
+        def work():
+            rc, _, _ = run(["git", "-C", path, "fetch", "--quiet", "--prune", "origin"], timeout=30)
+            if gen != self.fetch_gen:
+                return
+            if rc == 0:
+                self.main = load_main_info()
+                self.fetch_status = "ok"
+            else:
+                self.fetch_status = "err"  # offline / no origin: keep last-known numbers
+        threading.Thread(target=work, daemon=True).start()
+
+    def pull_main(self):
+        """Fast-forward the main checkout to its upstream (git pull --ff-only), after confirmation."""
+        mi = self.main
+        if not mi or mi["updown"] is None:
+            self.message = "! główna gałąź nie ma upstreamu"
+            return
+        behind, ahead = mi["updown"]
+        if not behind:
+            self.message = "nic do pobrania (0 w tyle)"
+            return
+        if ahead:
+            self.pending_error = ("Nie można przewinąć",
+                                  f"{mi['branch']} ma {ahead} lokalnych commitów, których nie ma na {mi['upstream']}.\n"
+                                  "Rozwiąż ręcznie (git pull --rebase albo push).")
+            return
+        if not self.confirm(f"Pobrać {behind} commitów z {mi['upstream']} do {mi['branch']} (ff-only)?"):
+            return
+        fail = self.run_steps([{"argv": ["git", "-C", mi["path"], "pull", "--ff-only", "--quiet"]}], "git pull --ff-only")
+        if fail:
+            self.pending_error = ("git pull nie powiódł się", fail[1])
+            self.message = "! git pull nie powiódł się"
+            return
+        self.reload()
+        self.message = f"pobrano {behind} commitów do {mi['branch']}"
 
     def start_pr_fetch(self):
         """Fetch PR/CI data for all branches in one background `gh` call (optional, never blocks)."""
@@ -1096,8 +1144,14 @@ class App:
                 parts += [("  │ ", sty("border")), ("origin: ", sty("dim")), (self.sym["ok"] + " zgodny", sty("green"))]
             else:
                 parts += [("  │ ", sty("border")), ("origin: ", sty("dim")),
-                          (f"{ud[0]} w tyle", sty("yellow") if ud[0] else sty("dim")), (" · ", sty("dim")),
-                          (f"{ud[1]} do przodu", sty("accent") if ud[1] else sty("dim"))]
+                          (f"↓{ud[0]} w tyle", sty("yellow") if ud[0] else sty("dim")), (" · ", sty("dim")),
+                          (f"↑{ud[1]} do przodu", sty("accent") if ud[1] else sty("dim"))]
+                if ud[0] and not ud[1]:
+                    parts += [("  (U = pobierz)", sty("dim"))]
+            if ud is not None and self.fetch_status == "loading":
+                parts += [(" · sprawdzam…", sty("dim"))]
+            elif ud is not None and self.fetch_status == "err":
+                parts += [(" · offline, stan z ostatniego fetch", sty("dim"))]
             n = len(mi["changed"])
             parts += [("  │ ", sty("border")), ("zmiany: ", sty("dim")),
                       (f"{n} niezacommitowanych" if n else "brak", sty("yellow") if n else sty("dim"))]
@@ -1131,10 +1185,12 @@ class App:
         else:
             lines.append([lab("origin"), (mi["upstream"], "accent")])
             lines.append([lab("w tyle"), (f"{ud[0]} commitów", "yellow" if ud[0] else "dim"),
-                          ("  (pobierz zmiany: git pull --ff-only)" if ud[0] else "", "dim")])
+                          ("  (U = pobierz: git pull --ff-only)" if ud[0] else "", "dim")])
             lines.append([lab("do przodu"), (f"{ud[1]} commitów", "accent" if ud[1] else "dim"),
                           ("  (niewypchnięte)" if ud[1] else "", "dim")])
-        lines.append([lab(""), ("stan z ostatniego fetch (wt new pobiera zmiany)", "dim")])
+        fetch_note = {"loading": "pobieram stan z origin…", "ok": "stan z origin aktualny (fetch przy starcie / r)",
+                      "err": "fetch nie powiódł się, stan z ostatniego fetch"}.get(self.fetch_status, "stan z ostatniego fetch")
+        lines.append([lab(""), (fetch_note, "dim")])
         changed = mi["changed"]
         lines += [[], [("Zmiany niezacommitowane", "accentb")]]
         room = max(1, ph - len(lines) - 3)
@@ -1752,7 +1808,7 @@ class App:
                 self.draw()
                 self.modal(title, text)
             self.draw()
-            self.scr.timeout(250 if self.pr_status == "loading" else -1)
+            self.scr.timeout(250 if "loading" in (self.pr_status, self.fetch_status) else -1)
             key = self.scr.getch()
             self.scr.timeout(-1)
             if key == curses.KEY_RESIZE or key == -1:
@@ -1860,6 +1916,8 @@ class App:
                     self.cursor = 0
             elif key == ord("n"):
                 self.new()
+            elif key == ord("U"):
+                self.pull_main()
             elif key == ord("C"):
                 self.show_help = False
                 self.config_screen()
