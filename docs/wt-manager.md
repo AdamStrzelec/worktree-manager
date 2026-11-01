@@ -186,7 +186,10 @@ Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wi
 | `C` | ekran konfiguracji: `j`/`k`, `Enter` edytuj klucz, `d` przywróć domyślną, `E` otwórz `.git/wt.conf` w `$VISUAL`/`$EDITOR`, `Esc` wróć |
 | `/`, `r`, `Esc` | filtr, odśwież (+ fetch), wyczyść filtr |
 | `U` | pobierz zmiany do głównego checkoutu (`git pull --ff-only`, z potwierdzeniem; odmawia, gdy main ma lokalne commity) |
+| `R` | włącza/wyłącza autoodświeżanie w tej sesji (autoodświeżanie nie robi `git fetch`) |
 | `q` | wyjście |
+
+Autoodświeżanie: co `WT_UI_POLL` s (domyślnie 30, `0` = wyłączone) pełny reload w tle, łącznie z PR/CI z `gh`. Dodatkowo co `WT_UI_STAT` s (domyślnie 2) `os.stat` na `HEAD`, `index`, `logs/HEAD` każdego worktree oraz `refs/heads`, `packed-refs`, `worktrees/`, `config` we wspólnym `.git`. Każda zmiana (commit, checkout, `git add`, nowy worktree) od razu uruchamia reload. Bez procesu gita, tak samo na macOS i Linuxie. Edycje plików bez `git add` widać po najbliższym pełnym reloadzie. Kursor zostaje na tym samym worktree, a nagłówek pokazuje `auto 30s` albo `odświeżanie…`.
 
 Każda akcja z efektem pokazuje modal z dokładną komendą; błędy trafiają do czerwonego modala. Push i `gh` żyją tylko w `wt-ui`, po potwierdzeniu, nigdy z force. Przy tworzeniu PR base to `wt-target`, tytuł to `wt-title` (albo nazwa gałęzi). Ręczna edycja pliku przez `E` nie przechodzi walidacji `config set` (ostrzega tylko o literówkach w kluczach).
 

@@ -250,6 +250,33 @@ print("PARSERY-OK")
 PY
 )
 contains "parsery wt-ui" "$out" "PARSERY-OK"
+# autorefresh: os.stat fingerprint of .git changes on commit / worktree add, not on idle
+out=$(cd "$R" && python3 - "$UIBIN" <<'PY' 2>&1
+import importlib.machinery, importlib.util, sys, os, subprocess, tempfile, time
+loader = importlib.machinery.SourceFileLoader("wt_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("wt_ui", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+d = tempfile.mkdtemp()
+g = lambda *a, cwd=d: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True)
+g("init", "-q", "-b", "main"); g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "a")
+paths = lambda: m.watch_paths(os.path.join(d, ".git"), [m.worktree_gitdir(d)] +
+                              [m.worktree_gitdir(os.path.join(d, "w"))] * os.path.isdir(os.path.join(d, "w")))
+fp = m.fingerprint(paths())
+assert m.fingerprint(paths()) == fp, "idle fingerprint changed"
+time.sleep(0.01); g("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "b")
+fp2 = m.fingerprint(paths()); assert fp2 != fp, "commit not detected"
+time.sleep(0.01); g("worktree", "add", "-q", "w", "-b", "w")
+assert m.fingerprint(paths()) != fp2, "worktree add not detected"
+assert m.worktree_gitdir(os.path.join(d, "w")) == os.path.realpath(os.path.join(d, ".git", "worktrees", "w")) or \
+       m.worktree_gitdir(os.path.join(d, "w")).endswith(os.path.join(".git", "worktrees", "w"))
+assert m.worktree_gitdir("/nie/ma") is None
+os.environ["X_T"] = "abc"; assert m.env_seconds("X_T", 30) == 30
+os.environ["X_T"] = "-1"; assert m.env_seconds("X_T", 30) == 30
+os.environ["X_T"] = "0"; assert m.env_seconds("X_T", 30) == 0
+print("AUTOREFRESH-OK")
+PY
+)
+contains "autorefresh: stat-check wykrywa commit i nowy worktree" "$out" "AUTOREFRESH-OK"
 LD=$(mktemp -d)
 ln -s "$WT_BIN" "$LD/wt"
 out=$(cd "$R" && "$SH" "$LD/wt" ui </dev/null 2>&1); rc=$?
