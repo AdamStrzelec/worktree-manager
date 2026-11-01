@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Terminal UI for wt: browse worktrees, see details and collisions, create and test.
+"""Terminal UI for wt: browse worktrees, see details and merge conflicts, create and test.
 
 Launched by `wt ui`. All git work goes through the `wt` script (WT_CMD) or read-only git calls.
 """
@@ -54,25 +54,6 @@ def parse_list(text):
     return rows
 
 
-def parse_collisions(text):
-    """Parse `wt status` stderr into {branch: [(other_branch, [files])]}."""
-    result = {}
-    current = None
-    for line in text.splitlines():
-        m = re.match(r"^KOLIZJA (.+) ↔ (.+):$", line)
-        if m:
-            a, b = m.group(1), m.group(2)
-            files = []
-            result.setdefault(a, []).append((b, files))
-            result.setdefault(b, []).append((a, files))
-            current = files
-        elif line.startswith("  ") and current is not None:
-            current.append(line.strip())
-        else:
-            current = None
-    return result
-
-
 def parse_base(text):
     for line in text.splitlines():
         if line.startswith("baza:"):
@@ -100,6 +81,54 @@ def load_main_info():
     _, st, _ = run(["git", "-C", path, "status", "--short"])
     return {"path": path, "branch": br.strip(), "updown": parse_updown(ud) if rc == 0 else None,
             "upstream": up.strip(), "changed": st.splitlines()}
+
+
+def env_seconds(name, default):
+    """Non-negative number of seconds from the environment; bad values fall back to the default."""
+    try:
+        v = float(os.environ.get(name, default))
+    except ValueError:
+        return default
+    return v if v >= 0 else default
+
+
+def worktree_gitdir(path):
+    """Git dir of a checkout: `<path>/.git` itself, or the `gitdir:` target of a linked worktree's .git file."""
+    dot = os.path.join(path, ".git")
+    if os.path.isdir(dot):
+        return dot
+    try:
+        with open(dot, encoding="utf-8") as f:
+            line = f.readline().strip()
+    except OSError:
+        return None
+    if not line.startswith("gitdir:"):
+        return None
+    gd = line[len("gitdir:"):].strip()
+    return gd if os.path.isabs(gd) else os.path.normpath(os.path.join(path, gd))
+
+
+def watch_paths(common, gitdirs):
+    """Files and dirs whose stat changes whenever git commits, checks out, stages or adds/removes a worktree."""
+    paths = []
+    if common:
+        paths += [os.path.join(common, n) for n in ("worktrees", "packed-refs", "config", "refs/heads")]
+    for gd in gitdirs:
+        if gd:
+            paths += [os.path.join(gd, n) for n in ("HEAD", "index", "logs/HEAD")]
+    return sorted(set(paths))
+
+
+def fingerprint(paths):
+    """Cheap change detector: (mtime, size, inode) per path via os.stat; no git process, works on macOS and Linux."""
+    fp = []
+    for p in paths:
+        try:
+            st = os.stat(p)
+            fp.append((p, st.st_mtime_ns, st.st_size, st.st_ino))
+        except OSError:
+            fp.append((p, None))
+    return tuple(fp)
 
 
 def parse_branch_config(text, key):
@@ -210,7 +239,7 @@ PR_FIELDS = "number,headRefName,baseRefName,isDraft,state,mergeable,statusCheckR
 MENU = [
     ("Wybrane worktree", [("t", "testy"), ("c", "kopiuj >"), ("o", "otwórz >"), ("p", "opcje PR >"), ("x", "usuń worktree")]),
     ("Nawigacja", [("j/k ↑/↓", "ruch (k na górze = nagłówek)"), ("gg/G", "góra / dół"), ("PgUp/PgDn", "strona")]),
-    ("Widok", [("/", "filtr"), ("r", "odśwież"), ("Esc", "wyczyść filtr")]),
+    ("Widok", [("/", "filtr"), ("r", "odśwież + fetch"), ("U", "pobierz zmiany do main (ff-only)"), ("R", "autoodświeżanie wł/wył"), ("Esc", "wyczyść filtr")]),
     ("Ogólne", [("n", "nowy worktree"), ("C", "konfiguracja"), ("Space", "zamknij menu"), ("q", "wyjście")]),
 ]
 PR_MENU = [
@@ -499,7 +528,6 @@ class App:
     def __init__(self, scr):
         self.scr = scr
         self.rows = []
-        self.collisions = {}
         self.base = ""
         self.cursor = 0
         self.on_header = False  # focus on the header (main checkout) instead of the list
@@ -521,6 +549,18 @@ class App:
         self.prs = {}           # branch -> PR info (from gh), filled in the background
         self.pr_status = "off"  # off (no gh) | loading | ok | err
         self.pr_gen = 0
+        self.fetch_status = "off"  # off | loading | ok | err (background `git fetch origin`)
+        self.fetch_gen = 0
+        # autorefresh: full reload every WT_UI_POLL s (0 = off), stat check of .git every WT_UI_STAT s
+        self.poll = env_seconds("WT_UI_POLL", 30)
+        self.stat_every = env_seconds("WT_UI_STAT", 2)
+        self.auto = self.poll > 0
+        self.refresh_gen = 0
+        self.refreshing = False
+        self.snapshot = None    # result of a background collect(), applied by the UI thread
+        self.watched = []
+        self.last_fp = None
+        self.next_stat = self.next_poll = 0.0
         self.init_style()
         self.reload()
 
@@ -674,35 +714,140 @@ class App:
 
     # ---- data ----
 
-    def reload(self):
+    @staticmethod
+    def collect():
+        """Read all list data without touching the UI (safe to run in a background thread)."""
         rc, out, err = run([WT, "list", "--porcelain"])
         if rc != 0:
-            self.message = "! wt list nie powiodło się"
-            self.rows = []
-            self.pending_error = ("Błąd", clean_error(err, "wt list nie powiodło się"))
-            return
-        self.rows = parse_list(out)
-        _, sout, serr = run([WT, "status"])
-        self.collisions = parse_collisions(serr + sout)
+            return {"error": clean_error(err, "wt list nie powiodło się")}
+        rows = parse_list(out)
         _, cout, cerr = run([WT, "config"])
-        self.base = parse_base(cout + cerr)
-        self.detail_cache = {}
         _, tt, _ = run(["git", "config", "--get-regexp", r"^branch\..*\.wt-title$"])
         _, tg, _ = run(["git", "config", "--get-regexp", r"^branch\..*\.wt-target$"])
         titles, targets = parse_branch_config(tt, "wt-title"), parse_branch_config(tg, "wt-target")
-        self.meta = {r["branch"]: {"title": titles.get(r["branch"], ""), "target": targets.get(r["branch"], ""),
-                                   "created": created_ts(r["path"])} for r in self.rows}
-        self.main = load_main_info()
-        self.start_pr_fetch()
+        meta = {r["branch"]: {"title": titles.get(r["branch"], ""), "target": targets.get(r["branch"], ""),
+                              "created": created_ts(r["path"])} for r in rows}
+        main = load_main_info()
+        common = os.path.join(main["path"], ".git") if main else None
+        gitdirs = [worktree_gitdir(p) for p in [r["path"] for r in rows] + ([main["path"]] if main else [])]
+        watched = watch_paths(common, gitdirs)
+        return {"rows": rows, "base": parse_base(cout + cerr),
+                "meta": meta, "main": main, "watched": watched, "fp": fingerprint(watched)}
 
-    def start_pr_fetch(self):
+    def apply(self, snap, silent=False):
+        """Swap in a collected snapshot, keeping the cursor on the same worktree path."""
+        if "error" in snap:
+            self.message = "! wt list nie powiodło się"
+            self.rows = []
+            if not silent:
+                self.pending_error = ("Błąd", snap["error"])
+            return
+        rows = self.visible()
+        cur = rows[self.cursor]["path"] if rows and 0 <= self.cursor < len(rows) else None
+        self.rows, self.base = snap["rows"], snap["base"]
+        self.meta, self.main = snap["meta"], snap["main"]
+        self.watched, self.last_fp = snap["watched"], snap["fp"]
+        self.detail_cache = {}
+        paths = [r["path"] for r in self.visible()]
+        if cur in paths:
+            self.cursor = paths.index(cur)
+        now = time.monotonic()
+        self.next_poll = now + self.poll
+        self.next_stat = now + self.stat_every
+        self.start_pr_fetch(silent=silent)
+
+    def reload(self):
+        self.refresh_gen += 1  # drop any background refresh still in flight
+        self.refreshing = False
+        self.apply(self.collect())
+        self.start_remote_fetch()  # network fetch only on start, r and after actions; not on autorefresh
+
+    def start_remote_fetch(self):
+        """`git fetch origin` in the background so behind/ahead reflect the real remote (never blocks)."""
+        if not self.main:
+            return
+        self.fetch_gen += 1
+        gen = self.fetch_gen
+        self.fetch_status = "loading"
+        path = self.main["path"]
+
+        def work():
+            rc, _, _ = run(["git", "-C", path, "fetch", "--quiet", "--prune", "origin"], timeout=30)
+            if gen != self.fetch_gen:
+                return
+            if rc == 0:
+                self.main = load_main_info()
+                self.fetch_status = "ok"
+            else:
+                self.fetch_status = "err"  # offline / no origin: keep last-known numbers
+        threading.Thread(target=work, daemon=True).start()
+
+    def pull_main(self):
+        """Fast-forward the main checkout to its upstream (git pull --ff-only), after confirmation."""
+        mi = self.main
+        if not mi or mi["updown"] is None:
+            self.message = "! główna gałąź nie ma upstreamu"
+            return
+        behind, ahead = mi["updown"]
+        if not behind:
+            self.message = "nic do pobrania (0 w tyle)"
+            return
+        if ahead:
+            self.pending_error = ("Nie można przewinąć",
+                                  f"{mi['branch']} ma {ahead} lokalnych commitów, których nie ma na {mi['upstream']}.\n"
+                                  "Rozwiąż ręcznie (git pull --rebase albo push).")
+            return
+        if not self.confirm(f"Pobrać {behind} commitów z {mi['upstream']} do {mi['branch']} (ff-only)?"):
+            return
+        fail = self.run_steps([{"argv": ["git", "-C", mi["path"], "pull", "--ff-only", "--quiet"]}], "git pull --ff-only")
+        if fail:
+            self.pending_error = ("git pull nie powiódł się", fail[1])
+            self.message = "! git pull nie powiódł się"
+            return
+        self.reload()
+        self.message = f"pobrano {behind} commitów do {mi['branch']}"
+
+    def start_refresh(self):
+        """Background reload; the UI thread applies the result in loop(). At most one in flight."""
+        if self.refreshing:
+            return
+        self.refreshing = True
+        self.refresh_gen += 1
+        gen = self.refresh_gen
+
+        def work():
+            snap = self.collect()
+            if gen == self.refresh_gen:
+                self.snapshot = snap
+        threading.Thread(target=work, daemon=True).start()
+
+    def tick(self):
+        """Called from loop() on every getch timeout; returns True when the screen needs a redraw."""
+        snap, self.snapshot = self.snapshot, None
+        if snap is not None:
+            self.refreshing = False
+            self.apply(snap, silent=True)
+            return True
+        if not self.auto or self.refreshing:
+            return False
+        now = time.monotonic()
+        if now >= self.next_poll:
+            self.start_refresh()
+        elif self.stat_every and now >= self.next_stat:
+            self.next_stat = now + self.stat_every
+            if fingerprint(self.watched) != self.last_fp:
+                self.start_refresh()
+        return self.refreshing
+
+    def start_pr_fetch(self, silent=False):
         """Fetch PR/CI data for all branches in one background `gh` call (optional, never blocks)."""
         if not shutil.which("gh"):
             self.pr_status = "off"
             return
         self.pr_gen += 1
         gen = self.pr_gen
-        self.pr_status = "loading"
+        if not (silent and self.pr_status == "ok"):  # autorefresh keeps showing the current PR data
+            self.pr_status = "loading"
 
         def work():
             rc, out, _ = run(["gh", "pr", "list", "--state", "all", "--limit", "100", "--json", PR_FIELDS],
@@ -919,11 +1064,11 @@ class App:
         return None
 
     def conflict_notes(self, r):
-        """Conflict warnings: overlap with other worktrees (wt status) and PR conflict with its target."""
+        """Conflict warnings, only when merging would actually fail: open PR that conflicts with its target.
+
+        Overlapping files between worktrees (wt status) are deliberately not shown: they are only
+        potential conflicts and most of them merge cleanly."""
         notes = []
-        others = [o for o, _ in self.collisions.get(r["branch"], [])]
-        if others:
-            notes.append("kolizja: " + ", ".join(others))
         pr = self.prs.get(r["branch"])
         if pr and pr["state"] == "OPEN" and pr["mergeable"] == "CONFLICTING":
             notes.append("konflikt z targetem PR")
@@ -1072,10 +1217,6 @@ class App:
         elif self.pr_status == "ok":
             lines.append([lab("PR"), ("brak", "dim")])
         lines.append([])
-        for other, files in self.collisions.get(r["branch"], []):
-            lines.append([("! Kolizja z ", "redb"), (other, "redb")])
-            lines += [[("    " + f, "red")] for f in files[:8]]
-            lines.append([])
         lines += self.details(r)
         for i, parts in enumerate(lines[:ph - 2]):
             self.segs(y0 + 1 + i, x0 + 2, parts, iw)
@@ -1096,13 +1237,23 @@ class App:
                 parts += [("  │ ", sty("border")), ("origin: ", sty("dim")), (self.sym["ok"] + " zgodny", sty("green"))]
             else:
                 parts += [("  │ ", sty("border")), ("origin: ", sty("dim")),
-                          (f"{ud[0]} w tyle", sty("yellow") if ud[0] else sty("dim")), (" · ", sty("dim")),
-                          (f"{ud[1]} do przodu", sty("accent") if ud[1] else sty("dim"))]
+                          (f"↓{ud[0]} w tyle", sty("yellow") if ud[0] else sty("dim")), (" · ", sty("dim")),
+                          (f"↑{ud[1]} do przodu", sty("accent") if ud[1] else sty("dim"))]
+                if ud[0] and not ud[1]:
+                    parts += [("  (U = pobierz)", sty("dim"))]
+            if ud is not None and self.fetch_status == "loading":
+                parts += [(" · sprawdzam…", sty("dim"))]
+            elif ud is not None and self.fetch_status == "err":
+                parts += [(" · offline, stan z ostatniego fetch", sty("dim"))]
             n = len(mi["changed"])
             parts += [("  │ ", sty("border")), ("zmiany: ", sty("dim")),
                       (f"{n} niezacommitowanych" if n else "brak", sty("yellow") if n else sty("dim"))]
         if self.filter:
             parts += [("  │ ", sty("border")), ("filtr: ", sty("dim")), (self.filter, sty("yellow"))]
+        if self.refreshing:
+            parts += [("  │ ", sty("border")), ("odświeżanie…", sty("dim"))]
+        elif self.auto:
+            parts += [("  │ ", sty("border")), (f"auto {self.poll:g}s", sty("dim"))]
         return parts
 
     def draw_header(self, rows, w):
@@ -1131,10 +1282,12 @@ class App:
         else:
             lines.append([lab("origin"), (mi["upstream"], "accent")])
             lines.append([lab("w tyle"), (f"{ud[0]} commitów", "yellow" if ud[0] else "dim"),
-                          ("  (pobierz zmiany: git pull --ff-only)" if ud[0] else "", "dim")])
+                          ("  (U = pobierz: git pull --ff-only)" if ud[0] else "", "dim")])
             lines.append([lab("do przodu"), (f"{ud[1]} commitów", "accent" if ud[1] else "dim"),
                           ("  (niewypchnięte)" if ud[1] else "", "dim")])
-        lines.append([lab(""), ("stan z ostatniego fetch (wt new pobiera zmiany)", "dim")])
+        fetch_note = {"loading": "pobieram stan z origin…", "ok": "stan z origin aktualny (fetch przy starcie / r)",
+                      "err": "fetch nie powiódł się, stan z ostatniego fetch"}.get(self.fetch_status, "stan z ostatniego fetch")
+        lines.append([lab(""), (fetch_note, "dim")])
         changed = mi["changed"]
         lines += [[], [("Zmiany niezacommitowane", "accentb")]]
         room = max(1, ph - len(lines) - 3)
@@ -1752,10 +1905,14 @@ class App:
                 self.draw()
                 self.modal(title, text)
             self.draw()
-            self.scr.timeout(250 if self.pr_status == "loading" else -1)
+            busy = "loading" in (self.pr_status, self.fetch_status) or self.refreshing
+            self.scr.timeout(250 if busy else 1000 if self.auto else -1)
             key = self.scr.getch()
             self.scr.timeout(-1)
-            if key == curses.KEY_RESIZE or key == -1:
+            if key == -1:
+                self.tick()
+                continue
+            if key == curses.KEY_RESIZE:
                 continue
             rows = self.visible()
             self.cursor = max(0, min(self.cursor, len(rows) - 1))
@@ -1853,6 +2010,11 @@ class App:
             elif key == ord("r"):
                 self.reload()
                 self.message = "odświeżono"
+            elif key == ord("R"):
+                self.auto = not self.auto and self.poll > 0
+                self.message = ("autoodświeżanie włączone" if self.auto else
+                                "autoodświeżanie wyłączone" if self.poll > 0 else "autoodświeżanie wyłączone (WT_UI_POLL=0)")
+                self.next_stat = self.next_poll = time.monotonic()
             elif key == ord("/"):
                 value = self.prompt("Filtr (pusty = wyczyść)", self.filter)
                 if not self.cancelled:
@@ -1860,6 +2022,8 @@ class App:
                     self.cursor = 0
             elif key == ord("n"):
                 self.new()
+            elif key == ord("U"):
+                self.pull_main()
             elif key == ord("C"):
                 self.show_help = False
                 self.config_screen()

@@ -171,7 +171,7 @@ WT_POST_NEW=npm install
 
 ## 5. `wt ui`
 
-Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wiek), szczegóły po prawej, na górze nagłówek (`k` z pierwszego worktree przechodzi na niego i pokazuje szczegóły głównego checkoutu: origin w tyle/do przodu, zmiany). Stan PR i CI pochodzi z GitHuba (`gh pr list` w tle). W szczegółach worktree każdy commit ponad bazą ma znacznik: `✓` jest już na origin, `↑` tylko lokalnie (do wypchnięcia). Liczone z refów `origin/*` z ostatniego fetch, bez sieci.
+Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wiek), szczegóły po prawej, na górze nagłówek (`k` z pierwszego worktree przechodzi na niego i pokazuje szczegóły głównego checkoutu: origin w tyle/do przodu, zmiany). Przy starcie i po `r` UI robi w tle `git fetch origin`, więc licznik w tyle/do przodu odpowiada zdalnemu stanowi; offline zostaje stan z ostatniego fetch. Stan PR i CI pochodzi z GitHuba (`gh pr list` w tle). Konflikt UI pokazuje tylko wtedy, gdy otwarty PR naprawdę nie da się zmergować do targetu (`mergeable = CONFLICTING` z GitHuba). Wspólne pliki zmieniane w kilku worktree (potencjalne kolizje) UI pomija, bo zwykle mergują się bez problemu; sprawdzisz je ręcznie przez `wt status`. W szczegółach worktree każdy commit ponad bazą ma znacznik: `✓` jest już na origin, `↑` tylko lokalnie (do wypchnięcia). Liczone z refów `origin/*` z ostatniego fetch, bez sieci.
 
 | Klawisz | Akcja |
 |---|---|
@@ -184,8 +184,12 @@ Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wi
 | `p` | podmenu PR: `p` push / utwórz PR (draft), `d` draft <-> ready, `m` merge PR, `M` merge + usuń worktree, `c` zamknij PR. Niedostępne opcje są wygaszone zgodnie ze stanem PR |
 | `x` | `wt drop` (z `--merged-pr`, gdy PR zmergowany) |
 | `C` | ekran konfiguracji: `j`/`k`, `Enter` edytuj klucz, `d` przywróć domyślną, `E` otwórz `.git/wt.conf` w `$VISUAL`/`$EDITOR`, `Esc` wróć |
-| `/`, `r`, `Esc` | filtr, odśwież, wyczyść filtr |
+| `/`, `r`, `Esc` | filtr, odśwież (+ fetch), wyczyść filtr |
+| `U` | pobierz zmiany do głównego checkoutu (`git pull --ff-only`, z potwierdzeniem; odmawia, gdy main ma lokalne commity) |
+| `R` | włącza/wyłącza autoodświeżanie w tej sesji (autoodświeżanie nie robi `git fetch`) |
 | `q` | wyjście |
+
+Autoodświeżanie: co `WT_UI_POLL` s (domyślnie 30, `0` = wyłączone) pełny reload w tle, łącznie z PR/CI z `gh`. Dodatkowo co `WT_UI_STAT` s (domyślnie 2) `os.stat` na `HEAD`, `index`, `logs/HEAD` każdego worktree oraz `refs/heads`, `packed-refs`, `worktrees/`, `config` we wspólnym `.git`. Każda zmiana (commit, checkout, `git add`, nowy worktree) od razu uruchamia reload. Bez procesu gita, tak samo na macOS i Linuxie. Edycje plików bez `git add` widać po najbliższym pełnym reloadzie. Kursor zostaje na tym samym worktree, a nagłówek pokazuje `auto 30s` albo `odświeżanie…`.
 
 Każda akcja z efektem pokazuje modal z dokładną komendą; błędy trafiają do czerwonego modala. Push i `gh` żyją tylko w `wt-ui`, po potwierdzeniu, nigdy z force. Przy tworzeniu PR base to `wt-target`, tytuł to `wt-title` (albo nazwa gałęzi). Ręczna edycja pliku przez `E` nie przechodzi walidacji `config set` (ostrzega tylko o literówkach w kluczach).
 
