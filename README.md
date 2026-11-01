@@ -91,7 +91,7 @@ wt status
 - `wt test` uruchamia testy w bieżącym worktree (komenda z konfiguracji, z pliku `.wt-test` albo wykryta automatycznie).
 - `wt list` pokazuje worktree: wiek ostatniego commita, liczbę commitów ponad bazą, liczbę brudnych plików i właściciela.
 - `wt status` wykrywa kolizje: pliki zmieniane jednocześnie w więcej niż jednym worktree.
-- `wt ui` otwiera interfejs: lista worktree po lewej, szczegóły i kolizje po prawej. Klawisze: `j`/`k` lub strzałki, `g`/`G`, `n` nowy worktree, `t` testy, `c` kopiuje `cd <ścieżka>` do schowka (`pbcopy`), `p` otwiera podmenu PR (push/PR, draft/ready, merge, merge + usuń, zamknij), `x` usuń worktree, `C` ekran konfiguracji, `Space` menu skrótów, `r` odśwież, `/` filtr, `q` wyjście. Pełna lista w [docs/wt-manager.md](docs/wt-manager.md).
+- `wt ui` otwiera interfejs: lista worktree po lewej, szczegóły i kolizje po prawej. Klawisze: `j`/`k` lub strzałki, `g`/`G`, `n` nowy worktree, `t` testy, `c` kopiuje `cd <ścieżka>` do schowka (`pbcopy`), `p` otwiera podmenu PR (push/PR, draft/ready, merge, merge + usuń, zamknij), `x` usuń worktree, `C` ekran konfiguracji, `Space` menu skrótów, `r` odśwież, `R` autoodświeżanie (co 30 s + natychmiast po commicie/nowym worktree), `/` filtr, `q` wyjście. Pełna lista w [docs/wt-manager.md](docs/wt-manager.md).
 - `wt list --porcelain` daje wyjście dla skryptów: ścieżka, gałąź, wiek, ahead, brudne, właściciel, rozdzielone tabulatorem.
 
 Komendy działają z dowolnego miejsca repo, także z wnętrza worktree.
