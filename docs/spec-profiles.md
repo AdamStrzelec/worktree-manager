@@ -188,7 +188,7 @@ Drop nie potrzebuje Pythona ani pliku profili; wystarczy `.wt-actions`. Brak pli
 3. `tmux-session` / `tmux-window` + sprzątanie w `drop`, `beforeDrop.sendKeys`, odmowa dropu z wnętrza sesji; testy na osobnym serwerze tmux.
 4. (scalone z 3)
 5. UI: ekrany Tryb i Akcje w `n`; `o` → `t`.
-6. UI: ekran Profile z zapisem do `.git/`.
+6. UI: ekran Profile z zapisem do `.git/`. Gotowe: błędy walidacji pokazane w oknie przy zapisie (plik nie zapisany).
 7. Docs (`docs/wt-manager.md`, README), przykładowy `profiles.json`.
 
 ## 10. Decyzje

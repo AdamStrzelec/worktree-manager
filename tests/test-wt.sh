@@ -1191,6 +1191,16 @@ assert m.open_menu_state(row, None, "ok", True)["t"][0] == "brak sesji"
 assert m.open_menu_state(row, None, "ok", True, "r/b", False)["t"][0] == "sesja zamknięta"
 assert m.open_menu_state(row, None, "ok", True, "r/b", True)["t"] is None
 assert m.load_profiles_module() is not None
+base = {"defaultMode": "a", "variables": {"v": {"choices": ["x", "y"], "default": "x"}},
+        "modes": {"a": {"actions": ["s"]}, "b": {"actions": []}}, "actions": {}, "prompts": {}}
+o = m.profile_override(None, base, base, {"defaultMode": "b", "variables": {"v": "y"}, "modes": {"a": []}})
+assert o == {"version": 1, "defaultMode": "b", "variables": {"v": {"choices": ["x", "y"], "default": "y"}},
+             "modes": {"a": {"actions": []}}}, o
+merged = dict(base, defaultMode="b")
+o = m.profile_override({"version": 1, "defaultMode": "b", "extra": 1}, base, merged, {"defaultMode": "a"})
+assert o == {"version": 1, "extra": 1}, o
+o = m.profile_override({"version": 1, "modes": {"a": {"actions": []}}}, base, base, {"modes": {"a": ["s"]}})
+assert o == {"version": 1}, o
 print("UI-PROFILES-OK")
 PY
 )
@@ -1261,6 +1271,60 @@ for w in "picker trybu" "opis trybu" "formularz akcji" "zmienna" "zależna oznac
   contains "UI pty: $w" "$out" "OK $w"
 done
 contains "UI pty: --skip z odznaczenia" "$(cat "$UT/.claude/worktrees/ui-a/.wt-actions" 2>/dev/null)" "action.rules.reason=pominięta (--skip)"
+rm -rf "$PX" "$UT"
+
+echo "-- profiles: UI ekran P (pty)"
+PX=$(mktemp -d); mkdir -p "$PX/wt"
+printf '%s' '{"version":1,"defaultMode":"a","variables":{"greet":{"label":"Powitanie","choices":["hej","siema"]}},"modes":{"a":{"label":"Alfa","actions":["s1","s2"]},"b":{"label":"Beta","actions":[]}},"actions":{"s1":{"type":"shell","label":"Pierwsza","run":"true"},"s2":{"type":"shell","label":"Druga","run":"true","needs":["s1"]}}}' > "$PX/wt/profiles.json"
+cat > "$PX/drivep.py" <<'PY'
+import fcntl, os, pty, select, struct, sys, termios, time
+wt_bin, cwd = sys.argv[1:3]
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(cwd); os.environ["TERM"] = "xterm-256color"; os.environ["WT_UI_POLL"] = "0"
+    os.execvp(os.environ.get("WT_SH", "bash"), [os.environ.get("WT_SH", "bash"), wt_bin, "ui"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+buf = b""
+def pump(sec):
+    global buf
+    end = time.time() + sec
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try: d = os.read(fd, 65536)
+            except OSError: return
+            if not d: return
+            buf += d
+def send(s): os.write(fd, s.encode())
+def until(txt, to=8):
+    end = time.time() + to
+    while time.time() < end:
+        pump(0.2)
+        if txt.encode() in buf: return True
+    return False
+def mark(name, ok): print(("OK " if ok else "FAIL ") + name)
+pump(2)
+send("P"); mark("ekran", until("Tryb domyślny"))
+send("l"); pump(0.4)                  # default mode a -> b
+send("j"); send("l"); pump(0.4)       # greet hej -> siema
+send("j"); send("\r"); pump(0.6)      # mode Alfa: edit actions
+mark("edytor akcji", until("Akcje trybu: Alfa"))
+send(" "); send("\r"); pump(0.6)      # drop s1 -> s2 needs s1 -> invalid
+send("s"); mark("błąd walidacji", until("nie zapisano", 4))
+send("\r"); pump(0.4)
+send("\r"); pump(0.6); send(" "); send("j"); send(" "); send("\r"); pump(0.6)  # s1 back on, s2 off
+buf = b""
+send("s"); mark("zapisane", until("profile zapisane", 4))
+send("q"); pump(1)
+PY
+UT=$(mkrepo)
+out=$(WT_SH="$SH" XDG_CONFIG_HOME="$PX" python3 "$PX/drivep.py" "$WT_BIN" "$UT" 2>&1)
+for w in "ekran" "edytor akcji" "błąd walidacji" "zapisane"; do
+  contains "UI P: $w" "$out" "OK $w"
+done
+got=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("defaultMode"), d["variables"]["greet"]["default"], d["modes"]["a"]["actions"], sorted(d))' "$UT/.git/wt-profiles.json" 2>&1)
+contains "UI P: minimalny zapis" "$got" "b siema ['s1'] ['defaultMode', 'modes', 'variables', 'version']"
+check "UI P: wt profiles check po zapisie" sh -c "cd '$UT' && XDG_CONFIG_HOME='$PX' $WT profiles check"
 rm -rf "$PX" "$UT"
 
 echo

@@ -240,7 +240,7 @@ MENU = [
     ("Wybrane worktree", [("t", "testy"), ("c", "kopiuj >"), ("o", "otwórz >"), ("p", "opcje PR >"), ("x", "usuń worktree")]),
     ("Nawigacja", [("j/k ↑/↓", "ruch (k na górze = nagłówek)"), ("gg/G", "góra / dół"), ("PgUp/PgDn", "strona")]),
     ("Widok", [("/", "filtr"), ("r", "odśwież + fetch"), ("U", "pobierz zmiany do main (ff-only)"), ("R", "autoodświeżanie wł/wył"), ("Esc", "wyczyść filtr")]),
-    ("Ogólne", [("n", "nowy worktree"), ("C", "konfiguracja"), ("Space", "zamknij menu"), ("q", "wyjście")]),
+    ("Ogólne", [("n", "nowy worktree"), ("C", "konfiguracja"), ("P", "profile"), ("Space", "zamknij menu"), ("q", "wyjście")]),
 ]
 PR_MENU = [
     ("p", "push / utwórz PR (draft)"), ("d", "draft <-> ready"), ("m", "merge PR"),
@@ -501,6 +501,43 @@ def tmux_argv(*args):
     """tmux command honoring WT_TMUX_SOCKET (private server used by tests)."""
     sock = os.environ.get("WT_TMUX_SOCKET")
     return ["tmux"] + (["-L", sock] if sock else []) + list(args)
+
+
+def profile_override(project, base, merged, edits):
+    """New project profile file: `project` (raw dict or None) with `edits` applied minimally.
+
+    base: config merged from the global file only; merged: current global+project config.
+    edits: {"defaultMode": id, "variables": {id: default}, "modes": {id: [action ids]}}, all optional.
+    A key equal to what the global file gives is dropped from the project file, not duplicated.
+    """
+    out = json.loads(json.dumps(project or {}))
+    out["version"] = 1
+    if "defaultMode" in edits:
+        if edits["defaultMode"] == base.get("defaultMode"):
+            out.pop("defaultMode", None)
+        else:
+            out["defaultMode"] = edits["defaultMode"]
+    for section, field in (("variables", "default"), ("modes", "actions")):
+        for key, value in edits.get(section, {}).items():
+            new = dict(merged[section][key])
+            new[field] = list(value) if isinstance(value, list) else value
+            part = out.setdefault(section, {})
+            if base[section].get(key) == new:
+                part.pop(key, None)
+            else:
+                part[key] = new
+            if not part:
+                out.pop(section)
+    return out
+
+
+def write_json_atomic(path, data):
+    """Write data as pretty JSON via a temp file in the same directory, then rename."""
+    tmp = "%s.tmp.%d" % (path, os.getpid())
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, path)
 
 
 def copy_menu_state(row, pr, pr_status, has_gh):
@@ -1892,6 +1929,147 @@ class App:
             values, unchecked, defaults = res
             return new_args(mode, defaults, values, unchecked)
 
+    def profiles_screen(self):
+        """`P`: view merged profiles, edit defaultMode, variable defaults and mode action lists.
+
+        Saves only to <repo>/.git/wt-profiles.json, as a minimal override of the global file.
+        """
+        got = self.load_profiles()
+        if got is None:
+            return
+        mod, cfg, origin = got
+        g, pj = profile_paths(self.main["path"]) if self.main else ("", "")
+        if cfg is None:
+            if self.main:
+                self.modal("Profile", f"Brak profili.\n\nGlobalne: {g}\nProjekt: {pj}\n\nPrzykład: docs/spec-profiles.md")
+            return
+        graw = mod.load_file(g, "global")
+        praw = mod.load_file(pj, "project")
+        base = mod.merge([("global", graw)])[0]
+        dmode = cfg["defaultMode"]
+        vals = {v: d.get("default", d["choices"][0]) for v, d in cfg["variables"].items()}
+        acts = {m: list(d.get("actions", [])) for m, d in cfg["modes"].items()}
+        rows = [("d", None)] + [("v", v) for v in sorted(vals)] + [("m", m) for m in sorted(acts)]
+        cur = 0
+
+        def edits():
+            e = {}
+            if dmode != cfg["defaultMode"]:
+                e["defaultMode"] = dmode
+            ev = {v: x for v, x in vals.items() if x != cfg["variables"][v].get("default", cfg["variables"][v]["choices"][0])}
+            em = {m: a for m, a in acts.items() if a != cfg["modes"][m].get("actions", [])}
+            if ev:
+                e["variables"] = ev
+            if em:
+                e["modes"] = em
+            return e
+
+        def src(key):
+            return {"global": "  [globalne]", "project": "  [projekt]"}.get(origin.get(key), "")
+
+        while True:
+            changed = edits()
+            entries = []
+            for kind, k in rows:
+                if kind == "d":
+                    mark = " *" if "defaultMode" in changed else ""
+                    label = cfg["modes"].get(dmode, {}).get("label", dmode) if dmode else "(brak)"
+                    entries.append([("Tryb domyślny: ", "plain"), ("< " + str(label) + " >", "accent"),
+                                    (mark, "yellow"), (src("defaultMode"), "dim")])
+                elif kind == "v":
+                    mark = " *" if k in changed.get("variables", {}) else ""
+                    entries.append([("Zmienna " + cfg["variables"][k].get("label", k) + ": ", "plain"),
+                                    ("< " + vals[k] + " >", "accent"), (mark, "yellow"), (src("variables." + k), "dim")])
+                else:
+                    mark = " *" if k in changed.get("modes", {}) else ""
+                    names = ", ".join(cfg["actions"].get(a, {}).get("label", a) for a in acts[k]) or "brak akcji"
+                    entries.append([("Tryb " + cfg["modes"][k].get("label", k) + ": ", "plain"), (names, "dim"),
+                                    (mark, "yellow"), (src("modes." + k), "dim")])
+            kind, k = rows[cur]
+            if kind == "d":
+                desc, foot = "Tryb wybrany domyślnie w `wt new` i w UI.", "[ ←/→: zmień ]"
+            elif kind == "v":
+                desc, foot = cfg["variables"][k].get("description", ""), "[ ←/→: zmień ]"
+            else:
+                desc, foot = cfg["modes"][k].get("description", ""), "[ Enter: edytuj akcje ]"
+            desc = (desc + "\n" if desc else "") + "zapis: " + pj
+            foot += "  [ s: zapisz ]  [ Esc: wyjdź ]"
+            self.list_box("Profile" + (" (zmienione)" if changed else ""), entries, cur, foot, desc)
+            key = self.scr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                cur = (cur - 1) % len(rows)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                cur = (cur + 1) % len(rows)
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l")) and kind in ("d", "v"):
+                step = 1 if key in (curses.KEY_RIGHT, ord("l")) else -1
+                if kind == "d":
+                    ch = sorted(cfg["modes"])
+                    dmode = ch[(ch.index(dmode) + step) % len(ch)] if dmode in ch else ch[0]
+                else:
+                    ch = cfg["variables"][k]["choices"]
+                    vals[k] = ch[(ch.index(vals[k]) + step) % len(ch)]
+            elif key in (10, 13, curses.KEY_ENTER) and kind == "m":
+                res = self.mode_actions_form(cfg, k, acts[k])
+                if res is not None:
+                    acts[k] = res
+            elif key == ord("s"):
+                if not changed:
+                    self.message = "profile: brak zmian"
+                    return
+                new = profile_override(praw, base, cfg, changed)
+                merged, morigin, errors, _ = mod.merge([("global", graw), ("project", new)])
+                if not errors:
+                    errors = mod.validate(merged, morigin)[0]
+                if errors:
+                    self.modal("Profile: nie zapisano", "\n".join(errors))
+                    continue
+                try:
+                    write_json_atomic(pj, new)
+                except OSError as e:
+                    self.modal("Profile: nie zapisano", str(e))
+                    continue
+                self.message = "profile zapisane: " + pj
+                return
+            elif key in (27, ord("q")):
+                if not changed or self.confirm("Porzucić niezapisane zmiany profili?"):
+                    return
+
+    def mode_actions_form(self, cfg, mode, current):
+        """Pick and order a mode's actions. Space toggles, J/K moves. Returns the new list or None."""
+        acts = cfg["actions"]
+        order = list(current) + sorted(a for a in acts if a not in current)
+        on = set(current)
+        cur = 0
+        if not order:
+            self.modal("Profile", "Brak zdefiniowanych akcji.")
+            return None
+        while True:
+            entries = [[("[x] " if a in on else "[ ] ", "green" if a in on else "dim"),
+                        (acts[a].get("label", a), "plain" if a in on else "dim"), (f"  {acts[a]['type']}", "dim")]
+                       for a in order]
+            a = order[cur]
+            desc = acts[a].get("description", "")
+            if acts[a].get("needs"):
+                desc += ("\n" if desc else "") + "wymaga (wcześniej na liście): " + ", ".join(acts[a]["needs"])
+            self.list_box(f"Akcje trybu: {cfg['modes'][mode].get('label', mode)}", entries, cur,
+                          "[ Space: wł/wył ]  [ J/K: przesuń ]  [ Enter: OK ]  [ Esc: anuluj ]", desc)
+            key = self.scr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                cur = (cur - 1) % len(order)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                cur = (cur + 1) % len(order)
+            elif key == ord(" "):
+                on.symmetric_difference_update({a})
+            elif key in (ord("J"), ord("K")):
+                to = cur + (1 if key == ord("J") else -1)
+                if 0 <= to < len(order):
+                    order[cur], order[to] = order[to], order[cur]
+                    cur = to
+            elif key in (10, 13, curses.KEY_ENTER):
+                return [x for x in order if x in on]
+            elif key in (27, ord("q")):
+                return None
+
     def new(self):
         res = self.new_form()
         if not res or not res[0]:
@@ -2361,6 +2539,9 @@ class App:
                 self.new()
             elif key == ord("U"):
                 self.pull_main()
+            elif key == ord("P"):
+                self.show_help = False
+                self.profiles_screen()
             elif key == ord("C"):
                 self.show_help = False
                 self.config_screen()

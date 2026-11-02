@@ -184,6 +184,7 @@ Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wi
 | `p` | podmenu PR: `p` push / utwórz PR (draft), `d` draft <-> ready, `m` merge PR, `M` merge + usuń worktree, `c` zamknij PR. Niedostępne opcje są wygaszone zgodnie ze stanem PR |
 | `x` | `wt drop` (z `--merged-pr`, gdy PR zmergowany) |
 | `C` | ekran konfiguracji: `j`/`k`, `Enter` edytuj klucz, `d` przywróć domyślną, `E` otwórz `.git/wt.conf` w `$VISUAL`/`$EDITOR`, `Esc` wróć |
+| `P` | ekran profili: `j`/`k`, `←`/`→` zmień tryb domyślny lub wartość zmiennej, `Enter` na trybie edytuje jego akcje (`Space` wł/wył, `J`/`K` kolejność), `s` zapisz do `.git/wt-profiles.json` (tylko różnice względem globalnego pliku, walidacja przed zapisem), `Esc` wyjdź |
 | `/`, `r`, `Esc` | filtr, odśwież (+ fetch), wyczyść filtr |
 | `U` | pobierz zmiany do głównego checkoutu (`git pull --ff-only`, z potwierdzeniem; odmawia, gdy main ma lokalne commity) |
 | `R` | włącza/wyłącza autoodświeżanie w tej sesji (autoodświeżanie nie robi `git fetch`) |
