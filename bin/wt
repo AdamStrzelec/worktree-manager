@@ -247,6 +247,7 @@ usage() {
     printf '  merge <temat>           testy, rebase, testy, merge --ff-only\n'
     printf '  drop <temat>            usuń worktree i gałąź (tylko gdy bezpieczne)\n'
     printf '  ui                      interfejs w terminalu (curses)\n'
+    printf '  profiles [list|check]   tryby i akcje z plików profili\n'
     printf '  config [set|unset|--porcelain] konfiguracja i jej źródła\n\n'
     printf 'Repo: %s\n' "${repo:-(poza repo git)}"
   } >&2
@@ -861,8 +862,9 @@ cmd_test() {
   run_tests "$top" "$@"
 }
 # cmd_ui - launch the curses UI (bin/wt-ui next to this script, symlinks resolved).
-cmd_ui() {
-  local src=$0 dir link
+# script_src - print the real path of this script (symlinks resolved; helpers live next to it).
+script_src() {
+  local src=$0 link
   while [ -L "$src" ]; do
     link=$(readlink "$src")
     case "$link" in
@@ -870,10 +872,47 @@ cmd_ui() {
       *)  src="$(dirname "$src")/$link" ;;
     esac
   done
+  printf '%s' "$src"
+}
+
+cmd_ui() {
+  local src dir
+  src=$(script_src)
   dir=$(cd "$(dirname "$src")" && pwd -P)
   [ -f "$dir/wt-ui" ] || die "brak pliku $dir/wt-ui"
   command -v python3 >/dev/null 2>&1 || die "wt ui wymaga python3"
   WT_CMD="$src" exec python3 "$dir/wt-ui" "$@"
+}
+
+# Profile files: global defaults and per-repo overrides (both trusted, never committed).
+profiles_global() { printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/wt/profiles.json"; }
+profiles_project() { printf '%s' "$MAIN/.git/wt-profiles.json"; }
+
+# profiles_helper ARGS... - run bin/wt-profiles with both profile files.
+profiles_helper() {
+  local dir
+  dir=$(cd "$(dirname "$(script_src)")" && pwd -P)
+  [ -f "$dir/wt-profiles" ] || die "brak pliku $dir/wt-profiles"
+  command -v python3 >/dev/null 2>&1 || die "profile wymagają python3"
+  local cmd=$1; shift
+  python3 "$dir/wt-profiles" "$cmd" --global "$(profiles_global)" --project "$(profiles_project)" "$@"
+}
+
+# cmd_profiles - show merged profiles (list) or validate them (check).
+cmd_profiles() {
+  local sub=${1:-list}
+  case "$sub" in
+    list|check) ;;
+    *) die "użycie: wt profiles [list|check]" ;;
+  esac
+  repo_main
+  if [ ! -f "$(profiles_global)" ] && [ ! -f "$(profiles_project)" ]; then
+    info "brak plików profili"
+    info "  globalne: $(profiles_global)"
+    info "  projekt:  $(profiles_project)"
+    return 0
+  fi
+  profiles_helper "$sub" || exit 1
 }
 cmd_merge()  { not_implemented merge; }
 # find_worktree BRANCH - print the path of the (non-main) worktree on BRANCH, or return 1.
@@ -1028,5 +1067,6 @@ case "${1:-}" in
   drop)        shift; cmd_drop "$@" ;;
   config)      shift; cmd_config "$@" ;;
   ui)          shift; cmd_ui "$@" ;;
+  profiles)    shift; cmd_profiles "$@" ;;
   *)           usage ;;
 esac

@@ -22,7 +22,7 @@ Pełny opis działania, konfiguracji i planów jest w [docs/wt-manager.md](docs/
 
 ## Instalacja
 
-Skrypt to `bin/wt` plus `bin/wt-ui` (interfejs `wt ui`, Python 3, bez zależności). `wt ui` szuka `wt-ui` obok prawdziwego pliku `wt`, więc przy kopiowaniu skopiuj oba pliki. Zalecana instalacja to symlink, bo `git pull` aktualizuje wtedy zainstalowaną wersję automatycznie.
+Skrypt to `bin/wt` plus `bin/wt-ui` (interfejs `wt ui`, Python 3, bez zależności) i `bin/wt-profiles` (profile, Python 3). `wt` szuka ich obok prawdziwego pliku `wt`, więc przy kopiowaniu skopiuj wszystkie trzy. Zalecana instalacja to symlink, bo `git pull` aktualizuje wtedy zainstalowaną wersję automatycznie.
 
 ```bash
 git clone https://github.com/AdamStrzelec/worktree-manager ~/repozytoria/worktree-manager

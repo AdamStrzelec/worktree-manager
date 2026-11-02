@@ -922,6 +922,129 @@ out=$(cd / && $WT list 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "poza repo exit 1" || bad "poza repo exit $rc"
 contains "poza repo komunikat" "$out" "nie jesteś w repo git"
 
+echo "-- profiles: moduł"
+PROFBIN=$(dirname "$WT_BIN")/wt-profiles
+check "wt-profiles kompiluje się" python3 -m py_compile "$PROFBIN"
+out=$(python3 - "$PROFBIN" <<'PY' 2>&1
+import importlib.machinery, importlib.util, sys, json, os, tempfile
+loader = importlib.machinery.SourceFileLoader("wt_profiles", sys.argv[1])
+spec = importlib.util.spec_from_loader("wt_profiles", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+d = tempfile.mkdtemp()
+def w(name, data):
+    p = os.path.join(d, name)
+    with open(p, "w") as f:
+        f.write(data if isinstance(data, str) else json.dumps(data))
+    return p
+def errs(g, p):
+    try:
+        m.load(g, p); return []
+    except m.ProfileError as e:
+        return e.errors
+G = {"version": 1, "defaultMode": "feature",
+     "variables": {"model": {"label": "Model", "choices": ["opus", "sonnet"], "default": "opus"}},
+     "prompts": {"review": "Przejrzyj {branch} vs {base}"},
+     "modes": {"feature": {"label": "F", "actions": ["rules", "deps", "dev", "tmux", "claude", "git"]},
+               "bare": {"actions": []}},
+     "actions": {
+        "rules": {"type": "file", "path": "docs/RULES-{mode}.md", "content": "b={branch} {{x}}"},
+        "deps": {"type": "shell", "run": "npm ci"},
+        "dev": {"type": "shell", "run": "echo {name}", "needs": ["deps"]},
+        "tmux": {"type": "tmux-session"},
+        "claude": {"type": "tmux-window", "window": "claude", "run": "claude --model {model} {prompt:review}",
+                   "beforeDrop": {"sendKeys": "/exit"}},
+        "git": {"type": "tmux-window", "window": "git", "run": "lazygit"}}}
+g = w("g.json", G)
+none = os.path.join(d, "nie-ma.json")
+# no files at all
+assert m.load(none, none) == (None, {}, [])
+cfg, origin, warn = m.load(g, none)
+assert warn == [] and cfg["defaultMode"] == "feature" and origin["actions.git"] == "global"
+# project layer: replace action, null removes, defaultMode wins
+P = {"version": 1, "defaultMode": "bare", "actions": {"git": {"type": "tmux-window", "window": "git", "run": "tig"}},
+     "modes": {"bare": None, "mini": {"actions": ["deps"]}}}
+P["defaultMode"] = "mini"
+cfg2, origin2, _ = m.load(g, w("p.json", P))
+assert cfg2["actions"]["git"]["run"] == "tig" and origin2["actions.git"] == "project"
+assert "bare" not in cfg2["modes"] and cfg2["defaultMode"] == "mini" and origin2["defaultMode"] == "project"
+# resolve
+ctx = {"name": "feat/x y", "branch": "feat/x y", "path": "/r/wt/x", "base": "main", "repo": "my.repo"}
+plan = m.resolve(cfg, ctx, None, ["model=sonnet"], [])
+byid = {a: (k, dict(f)) for k, a, f in plan}
+assert [a for _, a, _ in plan] == ["rules", "deps", "dev", "tmux", "claude", "git"]
+assert byid["rules"][1]["path"] == "docs/RULES-feature.md" and byid["rules"][1]["content"] == "b=feat/x y {x}"
+assert byid["dev"][1]["run"] == "echo 'feat/x y'", byid["dev"]
+assert byid["claude"][1]["run"] == "claude --model sonnet 'Przejrzyj feat/x y vs main'", byid["claude"]
+assert byid["claude"][1]["needs"] == "tmux" and byid["claude"][1]["beforeDrop.sendKeys"] == "/exit"
+assert byid["tmux"][1]["session"] == "my-repo/feat/x y" and byid["tmux"][1]["attach"] == "0"
+# --skip drops dependents transitively (explicit needs + implicit window->session)
+plan = m.resolve(cfg, ctx, "feature", [], ["deps", "tmux"])
+kinds = {a: k for k, a, _ in plan}
+assert kinds == {"rules": "action", "deps": "skip", "dev": "skip", "tmux": "skip", "claude": "skip", "git": "skip"}, kinds
+assert dict(plan[2][2])["reason"] == "pominięta (wymaga deps)"
+assert m.resolve(cfg, ctx, "bare") == []
+for args in (("nie-ma", [], []), ("feature", ["model=gpt"], []), ("feature", ["x=1"], []), ("feature", [], ["zzz"])):
+    try:
+        m.resolve(cfg, ctx, *args); raise AssertionError(args)
+    except m.ProfileError:
+        pass
+# encoding: NUL fields, empty key ends record
+enc = m.encode_plan([("action", "a", [("run", "x\ty\nz")]), ("skip", "b", [("reason", "r")])])
+assert enc == "action\0a\0run\0x\ty\nz\0\0skip\0b\0reason\0r\0\0", repr(enc)
+# validation errors
+assert any("linii 1" in e for e in errs(w("bad.json", '{"version": 1,}'), none))
+assert any("version" in e for e in errs(w("v.json", {"version": 2}), none))
+def bad(mutate, needle):
+    c = json.loads(json.dumps(G)); mutate(c)
+    e = errs(w("x.json", c), none)
+    assert any(needle in x for x in e), (needle, e)
+bad(lambda c: c["actions"]["deps"].update(type="nope"), "nieznany \"type\"")
+bad(lambda c: c["actions"]["deps"].pop("run"), "wymagane pole \"run\"")
+bad(lambda c: c["actions"]["rules"].update(path="../x"), "ścieżką względną")
+bad(lambda c: c["actions"]["rules"].update(path="/etc/x"), "ścieżką względną")
+bad(lambda c: c["actions"]["deps"].update(run="{oops}"), "nieznany placeholder {oops}")
+bad(lambda c: c["prompts"].update(r2="{prompt:review}"), "nieznany placeholder")
+bad(lambda c: c["actions"]["dev"].update(needs=["git"]), "musi stać wcześniej")
+bad(lambda c: c["actions"]["dev"].update(needs=["dev"]), "samej siebie")
+bad(lambda c: c["modes"]["bare"].update(actions=["dev"]), "której nie ma w trybie")
+bad(lambda c: c["modes"]["bare"].update(actions=["git"]), "wymaga wcześniejszej akcji tmux-session")
+bad(lambda c: c["modes"]["bare"].update(actions=["zzz"]), "nieznana akcja")
+bad(lambda c: c["modes"]["bare"].update(actions=["deps", "deps"]), "dwa razy")
+bad(lambda c: c["actions"]["git"].update(window="claude"), "okno \"claude\"")
+bad(lambda c: c["variables"]["model"].update(default="x"), "nie należy do")
+bad(lambda c: c["variables"].update(name={"choices": ["a"]}), "niedozwolona nazwa")
+bad(lambda c: c.update(defaultMode="zzz"), "defaultMode")
+bad(lambda c: c["actions"]["claude"].update(beforeDrop={"keys": "x"}), "beforeDrop")
+# unknown keys only warn
+c = json.loads(json.dumps(G)); c["extra"] = 1; c["actions"]["deps"]["foo"] = 1
+_, _, warn = m.load(w("u.json", c), none)
+assert len(warn) == 2, warn
+assert m.session_name("a.b", "c:d") == "a-b/c-d"
+print("PROFILES-OK")
+PY
+)
+contains "moduł wt-profiles" "$out" "PROFILES-OK"
+
+echo "-- profiles: wt profiles"
+PX=$(mktemp -d)
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "profiles bez plików exit 0" || bad "profiles bez plików exit $rc"
+contains "profiles bez plików komunikat" "$out" "brak plików profili"
+mkdir -p "$PX/wt"
+printf '%s\n' '{"version":1,"defaultMode":"f","modes":{"f":{"label":"Funkcja","actions":["s"]}},"actions":{"s":{"type":"shell","run":"true"}}}' > "$PX/wt/profiles.json"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "profiles list exit 0" || bad "profiles list exit $rc: $out"
+contains "profiles list tryb" "$out" "Funkcja"
+contains "profiles list źródło" "$out" "[globalne]"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles check 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "profiles check OK" || bad "profiles check exit $rc: $out"
+printf '%s\n' '{"version":1,"actions":{"s":{"type":"zly"}}}' > "$R/.git/wt-profiles.json"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles check 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "profiles check błąd exit != 0" || bad "profiles check przepuścił błąd"
+contains "profiles check komunikat" "$out" "actions.s [projekt]"
+rm -f "$R/.git/wt-profiles.json"; rm -rf "$PX"
+check_fail "profiles zła podkomenda" $WT profiles bogus
+
 echo
 echo "WYNIK: $PASS ok, $FAIL fail"
 [ "$FAIL" -eq 0 ]

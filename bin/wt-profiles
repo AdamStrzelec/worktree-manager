@@ -1,0 +1,482 @@
+#!/usr/bin/env python3
+"""Worktree profiles for wt: load, merge, validate and resolve modes into an action plan.
+
+Called by the `wt` script (bash only executes the resulting plan) and imported by wt-ui.
+No third-party dependencies.
+
+Usage:
+  wt-profiles list    --global G --project P
+  wt-profiles check   --global G --project P
+  wt-profiles resolve --global G --project P --name N --path P --branch B --base B --repo R
+                      [--mode M] [--set var=value]... [--skip action]...
+
+`resolve` prints the plan as NUL-separated fields. Each record is:
+  kind NUL id NUL (key NUL value NUL)* NUL
+where kind is "action" (to run) or "skip" (dropped, key "reason"). An empty key ends the record.
+"""
+import json
+import os
+import re
+import shlex
+import sys
+
+VERSION = 1
+SECTIONS = ("variables", "modes", "actions", "prompts")
+TOP_KEYS = {"version", "defaultMode"} | set(SECTIONS)
+ACTION_TYPES = {
+    # type: (required string fields, optional fields)
+    "file": (("path",), ("content",)),
+    "shell": (("run",), ()),
+    "tmux-session": ((), ("attach",)),
+    "tmux-window": (("window",), ("run", "beforeDrop")),
+}
+COMMON_ACTION_KEYS = {"type", "label", "description", "optional", "needs"}
+BUILTIN_PLACEHOLDERS = ("name", "branch", "path", "base", "repo", "mode", "session")
+# Fields whose placeholder values get shell-quoted (they are executed by bash/tmux).
+SHELL_FIELDS = {"run"}
+PLACEHOLDER_RE = re.compile(r"\{\{|\}\}|\{([^{}]*)\}")
+SOURCE_LABELS = {"global": "globalne", "project": "projekt"}
+
+
+class ProfileError(Exception):
+    """A list of validation errors (problems that block using profiles)."""
+
+    def __init__(self, errors):
+        super().__init__("\n".join(errors))
+        self.errors = errors
+
+
+# ----------------------------------------------------------------- loading --
+
+def load_file(path, source):
+    """Return the parsed JSON object, None when the file does not exist. Errors -> ProfileError."""
+    if not path or not os.path.isfile(path):
+        return None
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except json.JSONDecodeError as e:
+        raise ProfileError(["%s (%s): niepoprawny JSON w linii %d, kolumnie %d: %s"
+                            % (SOURCE_LABELS[source], path, e.lineno, e.colno, e.msg)])
+    except (OSError, UnicodeDecodeError) as e:
+        raise ProfileError(["%s (%s): nie można odczytać: %s" % (SOURCE_LABELS[source], path, e)])
+    if not isinstance(data, dict):
+        raise ProfileError(["%s (%s): plik musi zawierać obiekt JSON" % (SOURCE_LABELS[source], path)])
+    return data
+
+
+def merge(layers):
+    """Merge [(source, data)] from weakest to strongest.
+
+    Each section is merged per top-level key (whole object replaced, null removes).
+    Returns (config, origin) where origin maps "section.key" (and "defaultMode") to the source.
+    """
+    errors, warnings = [], []
+    cfg = {s: {} for s in SECTIONS}
+    cfg["defaultMode"] = None
+    origin = {}
+    for source, data in layers:
+        if data is None:
+            continue
+        label = SOURCE_LABELS[source]
+        if data.get("version") != VERSION:
+            errors.append("%s: wymagane \"version\": %d" % (label, VERSION))
+        for key in data:
+            if key not in TOP_KEYS:
+                warnings.append("%s: nieznany klucz \"%s\" (pomijam)" % (label, key))
+        for section in SECTIONS:
+            part = data.get(section)
+            if part is None:
+                continue
+            if not isinstance(part, dict):
+                errors.append("%s: \"%s\" musi być obiektem" % (label, section))
+                continue
+            for key, value in part.items():
+                if value is None:
+                    cfg[section].pop(key, None)
+                    origin.pop("%s.%s" % (section, key), None)
+                else:
+                    cfg[section][key] = value
+                    origin["%s.%s" % (section, key)] = source
+        if "defaultMode" in data:
+            cfg["defaultMode"] = data["defaultMode"]
+            origin["defaultMode"] = source
+    return cfg, origin, errors, warnings
+
+
+# -------------------------------------------------------------- validation --
+
+def placeholders(text):
+    """Names of placeholders used in text ({{ and }} are literal braces)."""
+    return [m.group(1) for m in PLACEHOLDER_RE.finditer(text) if m.group(1) is not None]
+
+
+def action_strings(action):
+    """(field, text) for every string field of an action that supports placeholders."""
+    out = []
+    for field in ("label", "description", "path", "content", "run", "window"):
+        if isinstance(action.get(field), str):
+            out.append((field, action[field]))
+    before = action.get("beforeDrop")
+    if isinstance(before, dict) and isinstance(before.get("sendKeys"), str):
+        out.append(("beforeDrop.sendKeys", before["sendKeys"]))
+    return out
+
+
+def bad_rel_path(p):
+    return (not p or p.startswith("/") or p.startswith("~")
+            or any(part == ".." for part in p.split("/")))
+
+
+def validate(cfg, origin):
+    """Return (errors, warnings) for a merged config."""
+    errors, warnings = [], []
+
+    def where(section, key):
+        src = origin.get("%s.%s" % (section, key))
+        return "%s.%s%s" % (section, key, " [%s]" % SOURCE_LABELS[src] if src else "")
+
+    variables = cfg["variables"]
+    for vid, var in variables.items():
+        w = where("variables", vid)
+        if not re.match(r"^[A-Za-z_][A-Za-z0-9_-]*$", vid) or vid in BUILTIN_PLACEHOLDERS or vid.startswith("prompt"):
+            errors.append("%s: niedozwolona nazwa zmiennej" % w)
+        if not isinstance(var, dict):
+            errors.append("%s: musi być obiektem" % w)
+            continue
+        choices = var.get("choices")
+        if not isinstance(choices, list) or not choices or not all(isinstance(c, str) for c in choices):
+            errors.append("%s: \"choices\" musi być niepustą listą napisów" % w)
+            continue
+        if "default" in var and var["default"] not in choices:
+            errors.append("%s: \"default\" (%r) nie należy do \"choices\"" % (w, var["default"]))
+        _check_text_fields(var, ("label", "description"), w, errors)
+
+    prompts = cfg["prompts"]
+    for pid, text in prompts.items():
+        if not isinstance(text, str):
+            errors.append("%s: prompt musi być napisem" % where("prompts", pid))
+            continue
+        for ph in placeholders(text):
+            if ph not in BUILTIN_PLACEHOLDERS and ph not in variables:
+                errors.append("%s: nieznany placeholder {%s} (prompt nie może wstawiać innych promptów)"
+                              % (where("prompts", pid), ph))
+
+    known = set(BUILTIN_PLACEHOLDERS) | set(variables) | {"prompt:" + p for p in prompts}
+    actions = cfg["actions"]
+    for aid, action in actions.items():
+        w = where("actions", aid)
+        if not isinstance(action, dict):
+            errors.append("%s: musi być obiektem" % w)
+            continue
+        atype = action.get("type")
+        if atype not in ACTION_TYPES:
+            errors.append("%s: nieznany \"type\" %r (dozwolone: %s)" % (w, atype, ", ".join(sorted(ACTION_TYPES))))
+            continue
+        required, optional = ACTION_TYPES[atype]
+        for field in required:
+            if not isinstance(action.get(field), str) or not action[field]:
+                errors.append("%s: wymagane pole \"%s\" (napis)" % (w, field))
+        for field in ("content", "run"):
+            if field in optional and field in action and not isinstance(action[field], str):
+                errors.append("%s: \"%s\" musi być napisem" % (w, field))
+        _check_text_fields(action, ("label", "description"), w, errors)
+        for flag in ("optional", "attach"):
+            if flag in action and not isinstance(action[flag], bool):
+                errors.append("%s: \"%s\" musi być true/false" % (w, flag))
+        if "beforeDrop" in action:
+            bd = action["beforeDrop"]
+            if not isinstance(bd, dict) or set(bd) != {"sendKeys"} or not isinstance(bd["sendKeys"], str):
+                errors.append("%s: \"beforeDrop\" musi mieć postać {\"sendKeys\": \"...\"}" % w)
+        needs = action.get("needs", [])
+        if not isinstance(needs, list) or not all(isinstance(n, str) for n in needs):
+            errors.append("%s: \"needs\" musi być listą id akcji" % w)
+        for key in action:
+            if key not in COMMON_ACTION_KEYS and key not in required and key not in optional:
+                warnings.append("%s: nieznane pole \"%s\" (pomijam)" % (w, key))
+        if atype == "file" and isinstance(action.get("path"), str) and bad_rel_path(action["path"]):
+            errors.append("%s: \"path\" musi być ścieżką względną bez \"..\"" % w)
+        for field, text in action_strings(action):
+            for ph in placeholders(text):
+                if ph not in known:
+                    errors.append("%s: pole \"%s\": nieznany placeholder {%s}" % (w, field, ph))
+
+    modes = cfg["modes"]
+    for mid, mode in modes.items():
+        w = where("modes", mid)
+        if not isinstance(mode, dict):
+            errors.append("%s: musi być obiektem" % w)
+            continue
+        _check_text_fields(mode, ("label", "description"), w, errors)
+        ids = mode.get("actions", [])
+        if not isinstance(ids, list) or not all(isinstance(a, str) for a in ids):
+            errors.append("%s: \"actions\" musi być listą id akcji" % w)
+            continue
+        seen, sessions, windows = [], [], {}
+        for aid in ids:
+            if aid in seen:
+                errors.append("%s: akcja \"%s\" występuje dwa razy" % (w, aid))
+                continue
+            action = actions.get(aid)
+            if action is None:
+                errors.append("%s: nieznana akcja \"%s\"" % (w, aid))
+                seen.append(aid)
+                continue
+            if not isinstance(action, dict):
+                seen.append(aid)
+                continue
+            needs = action.get("needs", [])
+            if isinstance(needs, list):
+                for n in needs:
+                    if n == aid:
+                        errors.append("%s: akcja \"%s\" wymaga samej siebie" % (w, aid))
+                    elif n not in ids:
+                        errors.append("%s: akcja \"%s\" wymaga \"%s\", której nie ma w trybie" % (w, aid, n))
+                    elif n not in seen:
+                        errors.append("%s: akcja \"%s\" wymaga \"%s\", która musi stać wcześniej na liście" % (w, aid, n))
+            atype = action.get("type")
+            if atype == "tmux-session":
+                sessions.append(aid)
+                if len(sessions) > 1:
+                    errors.append("%s: więcej niż jedna akcja tmux-session" % w)
+            elif atype == "tmux-window":
+                if not sessions:
+                    errors.append("%s: okno \"%s\" wymaga wcześniejszej akcji tmux-session" % (w, aid))
+                win = action.get("window")
+                if isinstance(win, str):
+                    if win in windows:
+                        errors.append("%s: okno \"%s\" zdefiniowane w \"%s\" i \"%s\"" % (w, win, windows[win], aid))
+                    windows[win] = aid
+            seen.append(aid)
+
+    dm = cfg["defaultMode"]
+    if dm is not None and (not isinstance(dm, str) or dm not in modes):
+        errors.append("defaultMode: nieznany tryb %r" % (dm,))
+    return errors, warnings
+
+
+def _check_text_fields(obj, fields, where, errors):
+    for field in fields:
+        if field in obj and not isinstance(obj[field], str):
+            errors.append("%s: \"%s\" musi być napisem" % (where, field))
+
+
+def load(global_path, project_path):
+    """Load, merge and validate. Returns (cfg, origin, warnings). Raises ProfileError.
+
+    cfg is None when neither file exists.
+    """
+    errors = []
+    layers = []
+    for source, path in (("global", global_path), ("project", project_path)):
+        try:
+            layers.append((source, load_file(path, source)))
+        except ProfileError as e:
+            errors.extend(e.errors)
+    if errors:
+        raise ProfileError(errors)
+    if all(data is None for _, data in layers):
+        return None, {}, []
+    cfg, origin, errors, warnings = merge(layers)
+    if not errors:
+        verrors, vwarnings = validate(cfg, origin)
+        errors += verrors
+        warnings += vwarnings
+    if errors:
+        raise ProfileError(errors)
+    return cfg, origin, warnings
+
+
+# --------------------------------------------------------------- resolving --
+
+def session_name(repo, name):
+    """tmux session name: repo/name with characters tmux rejects ('.' and ':') replaced by '-'."""
+    return re.sub(r"[.:]", "-", "%s/%s" % (repo, name))
+
+
+def substitute(text, values, quote):
+    def rep(m):
+        if m.group(0) == "{{":
+            return "{"
+        if m.group(0) == "}}":
+            return "}"
+        value = values[m.group(1)]
+        return shlex.quote(value) if quote else value
+    return PLACEHOLDER_RE.sub(rep, text)
+
+
+def var_defaults(cfg):
+    return {vid: var.get("default", var["choices"][0]) for vid, var in cfg["variables"].items()}
+
+
+def resolve(cfg, ctx, mode=None, sets=(), skips=()):
+    """Turn a mode into a plan: list of (kind, id, fields) with kind "action" or "skip".
+
+    ctx: dict with name, branch, path, base, repo. sets: ["var=value"]. skips: [action id].
+    Raises ProfileError on bad arguments.
+    """
+    errors = []
+    mode = mode or cfg["defaultMode"]
+    if mode is None:
+        return []
+    if mode not in cfg["modes"]:
+        raise ProfileError(["nieznany tryb \"%s\" (dostępne: %s)" % (mode, ", ".join(sorted(cfg["modes"])) or "brak")])
+    ids = cfg["modes"][mode].get("actions", [])
+
+    values = var_defaults(cfg)
+    for item in sets:
+        key, sep, val = item.partition("=")
+        var = cfg["variables"].get(key)
+        if not sep or var is None:
+            errors.append("--set %s: nieznana zmienna (dostępne: %s)" % (item, ", ".join(sorted(cfg["variables"])) or "brak"))
+        elif val not in var["choices"]:
+            errors.append("--set %s: wartość spoza %s" % (item, var["choices"]))
+        else:
+            values[key] = val
+    for s in skips:
+        if s not in ids:
+            errors.append("--skip %s: brak takiej akcji w trybie \"%s\"" % (s, mode))
+    if errors:
+        raise ProfileError(errors)
+
+    values.update({k: ctx[k] for k in ("name", "branch", "path", "base", "repo")})
+    values["mode"] = mode
+    values["session"] = session_name(ctx["repo"], ctx["name"])
+    for pid, text in cfg["prompts"].items():
+        values["prompt:" + pid] = substitute(text, values, False)
+
+    plan, dropped = [], {}
+    session_id = next((a for a in ids if cfg["actions"][a]["type"] == "tmux-session"), None)
+    for aid in ids:
+        action = cfg["actions"][aid]
+        needs = list(action.get("needs", []))
+        if action["type"] == "tmux-window" and session_id and session_id not in needs:
+            needs.append(session_id)
+        if aid in skips:
+            dropped[aid] = "pominięta (--skip)"
+        else:
+            missing = [n for n in needs if n in dropped]
+            if missing:
+                dropped[aid] = "pominięta (wymaga %s)" % ", ".join(missing)
+        if aid in dropped:
+            plan.append(("skip", aid, [("reason", dropped[aid])]))
+            continue
+        fields = [("type", action["type"]), ("label", substitute(action.get("label", aid), values, False)),
+                  ("needs", " ".join(needs))]
+        for field, text in action_strings(action):
+            if field in ("label", "description"):
+                continue
+            fields.append((field, substitute(text, values, field in SHELL_FIELDS)))
+        if action["type"] == "file" and bad_rel_path(dict(fields)["path"]):
+            raise ProfileError(["akcja \"%s\": ścieżka po podstawieniu jest niedozwolona: %s" % (aid, dict(fields)["path"])])
+        if action["type"] == "tmux-session":
+            fields.append(("session", values["session"]))
+            fields.append(("attach", "1" if action.get("attach") else "0"))
+        plan.append(("action", aid, fields))
+    return plan
+
+
+def encode_plan(plan):
+    out = []
+    for kind, aid, fields in plan:
+        parts = [kind, aid]
+        for k, v in fields:
+            if "\0" in v:
+                raise ProfileError(["akcja \"%s\": pole \"%s\" zawiera znak NUL" % (aid, k)])
+            parts += [k, v]
+        parts.append("")
+        out.append("\0".join(parts) + "\0")
+    return "".join(out)
+
+
+# --------------------------------------------------------------------- CLI --
+
+def describe(cfg, origin, paths):
+    def src(section, key):
+        return SOURCE_LABELS.get(origin.get("%s.%s" % (section, key)), "?")
+
+    lines = ["pliki:"]
+    for source, path in paths:
+        lines.append("  %-9s %s%s" % (SOURCE_LABELS[source], path, "" if os.path.isfile(path) else " (brak)"))
+    lines.append("domyślny tryb: %s" % (cfg["defaultMode"] or "(brak: bez akcji)"))
+    lines.append("tryby:")
+    for mid, mode in sorted(cfg["modes"].items()):
+        lines.append("  %-14s %-28s [%s]" % (mid, mode.get("label", mid), src("modes", mid)))
+        if mode.get("description"):
+            lines.append("  %-14s %s" % ("", mode["description"]))
+        lines.append("  %-14s akcje: %s" % ("", ", ".join(mode.get("actions", [])) or "(brak)"))
+    lines.append("akcje:")
+    for aid, action in sorted(cfg["actions"].items()):
+        lines.append("  %-14s %-13s %-28s [%s]" % (aid, action["type"], action.get("label", aid), src("actions", aid)))
+    lines.append("zmienne:")
+    for vid, var in sorted(cfg["variables"].items()):
+        lines.append("  %-14s %s = %s  (%s)  [%s]" % (vid, var.get("label", vid), var.get("default", var["choices"][0]),
+                                                      " | ".join(var["choices"]), src("variables", vid)))
+    if cfg["prompts"]:
+        lines.append("prompty: %s" % ", ".join(sorted(cfg["prompts"])))
+    return "\n".join(lines)
+
+
+def parse_args(argv):
+    if not argv:
+        raise SystemExit(__doc__)
+    cmd, rest = argv[0], argv[1:]
+    single = {"--global", "--project", "--name", "--path", "--branch", "--base", "--repo", "--mode"}
+    multi = {"--set", "--skip"}
+    opts = {k: None for k in single}
+    opts.update({k: [] for k in multi})
+    i = 0
+    while i < len(rest):
+        key = rest[i]
+        if (key not in single and key not in multi) or i + 1 >= len(rest):
+            raise SystemExit("wt-profiles: zły argument: %s" % key)
+        if key in multi:
+            opts[key].append(rest[i + 1])
+        else:
+            opts[key] = rest[i + 1]
+        i += 2
+    return cmd, opts
+
+
+def main(argv):
+    cmd, opts = parse_args(argv)
+    paths = [("global", opts["--global"] or ""), ("project", opts["--project"] or "")]
+    try:
+        cfg, origin, warnings = load(paths[0][1], paths[1][1])
+    except ProfileError as e:
+        for err in e.errors:
+            print("błąd: " + err, file=sys.stderr)
+        return 2
+    for w in warnings:
+        print("uwaga: " + w, file=sys.stderr)
+
+    if cmd == "check":
+        print("profile OK" if cfg else "brak plików profili")
+        return 0
+    if cmd == "list":
+        print(describe(cfg, origin, paths) if cfg else "brak plików profili")
+        return 0
+    if cmd == "resolve":
+        if cfg is None:
+            if opts["--mode"]:
+                print("błąd: --mode wymaga pliku profili", file=sys.stderr)
+                return 2
+            return 0
+        ctx = {}
+        for k in ("name", "branch", "path", "base", "repo"):
+            if opts["--" + k] is None:
+                print("błąd: resolve wymaga --%s" % k, file=sys.stderr)
+                return 2
+            ctx[k] = opts["--" + k]
+        try:
+            sys.stdout.write(encode_plan(resolve(cfg, ctx, opts["--mode"], opts["--set"], opts["--skip"])))
+        except ProfileError as e:
+            for err in e.errors:
+                print("błąd: " + err, file=sys.stderr)
+            return 2
+        return 0
+    raise SystemExit("wt-profiles: nieznana komenda: %s" % cmd)
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
