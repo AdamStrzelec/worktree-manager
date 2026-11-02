@@ -5,6 +5,9 @@ SH=${1:-bash}
 WT_BIN=${WT_BIN:-$(cd "$(dirname "$0")/.." && pwd -P)/bin/wt}
 WT="$SH $WT_BIN"
 PASS=0 FAIL=0
+# Never read the user's real profiles (~/.config/wt/profiles.json): empty config home per run.
+XDG_CONFIG_HOME=$(mktemp -d); export XDG_CONFIG_HOME
+trap 'rm -rf "$XDG_CONFIG_HOME"' EXIT
 
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
@@ -35,7 +38,7 @@ mkrepo() {
 
 echo "== bash: $SH =="
 R=$(mkrepo)
-trap 'rm -rf "$R"' EXIT
+trap 'rm -rf "$R" "$XDG_CONFIG_HOME"' EXIT
 cd "$R" || exit 1
 
 echo "-- usage"
@@ -921,6 +924,419 @@ echo "-- poza repo"
 out=$(cd / && $WT list 2>&1); rc=$?
 [ "$rc" -eq 1 ] && ok "poza repo exit 1" || bad "poza repo exit $rc"
 contains "poza repo komunikat" "$out" "nie jesteś w repo git"
+
+echo "-- profiles: moduł"
+PROFBIN=$(dirname "$WT_BIN")/wt-profiles
+check "wt-profiles kompiluje się" python3 -m py_compile "$PROFBIN"
+out=$(python3 - "$PROFBIN" <<'PY' 2>&1
+import importlib.machinery, importlib.util, sys, json, os, tempfile
+loader = importlib.machinery.SourceFileLoader("wt_profiles", sys.argv[1])
+spec = importlib.util.spec_from_loader("wt_profiles", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+d = tempfile.mkdtemp()
+def w(name, data):
+    p = os.path.join(d, name)
+    with open(p, "w") as f:
+        f.write(data if isinstance(data, str) else json.dumps(data))
+    return p
+def errs(g, p):
+    try:
+        m.load(g, p); return []
+    except m.ProfileError as e:
+        return e.errors
+G = {"version": 1, "defaultMode": "feature",
+     "variables": {"model": {"label": "Model", "choices": ["opus", "sonnet"], "default": "opus"}},
+     "prompts": {"review": "Przejrzyj {branch} vs {base}"},
+     "modes": {"feature": {"label": "F", "actions": ["rules", "deps", "dev", "tmux", "claude", "git"]},
+               "bare": {"actions": []}},
+     "actions": {
+        "rules": {"type": "file", "path": "docs/RULES-{mode}.md", "content": "b={branch} {{x}}"},
+        "deps": {"type": "shell", "run": "npm ci"},
+        "dev": {"type": "shell", "run": "echo {name}", "needs": ["deps"]},
+        "tmux": {"type": "tmux-session"},
+        "claude": {"type": "tmux-window", "window": "claude", "run": "claude --model {model} {prompt:review}",
+                   "beforeDrop": {"sendKeys": "/exit"}},
+        "git": {"type": "tmux-window", "window": "git", "run": "lazygit"}}}
+g = w("g.json", G)
+none = os.path.join(d, "nie-ma.json")
+# no files at all
+assert m.load(none, none) == (None, {}, [])
+cfg, origin, warn = m.load(g, none)
+assert warn == [] and cfg["defaultMode"] == "feature" and origin["actions.git"] == "global"
+# project layer: replace action, null removes, defaultMode wins
+P = {"version": 1, "defaultMode": "bare", "actions": {"git": {"type": "tmux-window", "window": "git", "run": "tig"}},
+     "modes": {"bare": None, "mini": {"actions": ["deps"]}}}
+P["defaultMode"] = "mini"
+cfg2, origin2, _ = m.load(g, w("p.json", P))
+assert cfg2["actions"]["git"]["run"] == "tig" and origin2["actions.git"] == "project"
+assert "bare" not in cfg2["modes"] and cfg2["defaultMode"] == "mini" and origin2["defaultMode"] == "project"
+# resolve
+ctx = {"name": "feat/x y", "branch": "feat/x y", "path": "/r/wt/x", "base": "main", "repo": "my.repo"}
+plan = m.resolve(cfg, ctx, None, ["model=sonnet"], [])
+byid = {a: (k, dict(f)) for k, a, f in plan}
+assert [a for _, a, _ in plan] == ["rules", "deps", "dev", "tmux", "claude", "git"]
+assert byid["rules"][1]["path"] == "docs/RULES-feature.md" and byid["rules"][1]["content"] == "b=feat/x y {x}"
+assert byid["dev"][1]["run"] == "echo 'feat/x y'", byid["dev"]
+assert byid["claude"][1]["run"] == "claude --model sonnet 'Przejrzyj feat/x y vs main'", byid["claude"]
+assert byid["claude"][1]["needs"] == "tmux" and byid["claude"][1]["beforeDrop.sendKeys"] == "/exit"
+assert byid["tmux"][1]["session"] == "my-repo/feat/x y" and byid["tmux"][1]["attach"] == "0"
+# --skip drops dependents transitively (explicit needs + implicit window->session)
+plan = m.resolve(cfg, ctx, "feature", [], ["deps", "tmux"])
+kinds = {a: k for k, a, _ in plan}
+assert kinds == {"rules": "action", "deps": "skip", "dev": "skip", "tmux": "skip", "claude": "skip", "git": "skip"}, kinds
+assert dict(plan[2][2])["reason"] == "pominięta (wymaga deps)" and dict(plan[2][2])["label"] == "dev"
+assert m.resolve(cfg, ctx, "bare") == []
+for args in (("nie-ma", [], []), ("feature", ["model=gpt"], []), ("feature", ["x=1"], []), ("feature", [], ["zzz"])):
+    try:
+        m.resolve(cfg, ctx, *args); raise AssertionError(args)
+    except m.ProfileError:
+        pass
+# encoding: NUL fields, empty key ends record
+enc = m.encode_plan([("action", "a", [("run", "x\ty\nz")]), ("skip", "b", [("reason", "r")])])
+assert enc == "action\0a\0run\0x\ty\nz\0\0skip\0b\0reason\0r\0\0", repr(enc)
+# validation errors
+assert any("linii 1" in e for e in errs(w("bad.json", '{"version": 1,}'), none))
+assert any("version" in e for e in errs(w("v.json", {"version": 2}), none))
+def bad(mutate, needle):
+    c = json.loads(json.dumps(G)); mutate(c)
+    e = errs(w("x.json", c), none)
+    assert any(needle in x for x in e), (needle, e)
+bad(lambda c: c["actions"]["deps"].update(type="nope"), "nieznany \"type\"")
+bad(lambda c: c["actions"]["deps"].pop("run"), "wymagane pole \"run\"")
+bad(lambda c: c["actions"]["rules"].update(path="../x"), "ścieżką względną")
+bad(lambda c: c["actions"]["rules"].update(path="/etc/x"), "ścieżką względną")
+bad(lambda c: c["actions"]["deps"].update(run="{oops}"), "nieznany placeholder {oops}")
+bad(lambda c: c["prompts"].update(r2="{prompt:review}"), "nieznany placeholder")
+bad(lambda c: c["actions"]["dev"].update(needs=["git"]), "musi stać wcześniej")
+bad(lambda c: c["actions"]["dev"].update(needs=["dev"]), "samej siebie")
+bad(lambda c: c["modes"]["bare"].update(actions=["dev"]), "której nie ma w trybie")
+bad(lambda c: c["modes"]["bare"].update(actions=["git"]), "wymaga wcześniejszej akcji tmux-session")
+bad(lambda c: c["modes"]["bare"].update(actions=["zzz"]), "nieznana akcja")
+bad(lambda c: c["modes"]["bare"].update(actions=["deps", "deps"]), "dwa razy")
+bad(lambda c: c["actions"]["git"].update(window="claude"), "okno \"claude\"")
+bad(lambda c: c["variables"]["model"].update(default="x"), "nie należy do")
+bad(lambda c: c["variables"].update(name={"choices": ["a"]}), "niedozwolona nazwa")
+bad(lambda c: c.update(defaultMode="zzz"), "defaultMode")
+bad(lambda c: c["actions"]["claude"].update(beforeDrop={"keys": "x"}), "beforeDrop")
+# unknown keys only warn
+c = json.loads(json.dumps(G)); c["extra"] = 1; c["actions"]["deps"]["foo"] = 1
+_, _, warn = m.load(w("u.json", c), none)
+assert len(warn) == 2, warn
+assert m.session_name("a.b", "c:d") == "a-b/c-d"
+print("PROFILES-OK")
+PY
+)
+contains "moduł wt-profiles" "$out" "PROFILES-OK"
+
+echo "-- profiles: wt profiles"
+PX=$(mktemp -d); mkdir -p "$PX/wt"; cp "$(dirname "$WT_BIN")/../examples/profiles.json" "$PX/wt/"
+check "examples/profiles.json przechodzi walidację" sh -c "cd '$R' && XDG_CONFIG_HOME='$PX' $WT profiles check"
+rm -rf "$PX"
+PX=$(mktemp -d)
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "profiles bez plików exit 0" || bad "profiles bez plików exit $rc"
+contains "profiles bez plików komunikat" "$out" "brak plików profili"
+mkdir -p "$PX/wt"
+printf '%s\n' '{"version":1,"defaultMode":"f","modes":{"f":{"label":"Funkcja","actions":["s"]}},"actions":{"s":{"type":"shell","run":"true"}}}' > "$PX/wt/profiles.json"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "profiles list exit 0" || bad "profiles list exit $rc: $out"
+contains "profiles list tryb" "$out" "Funkcja"
+contains "profiles list źródło" "$out" "[globalne]"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles check 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "profiles check OK" || bad "profiles check exit $rc: $out"
+printf '%s\n' '{"version":1,"actions":{"s":{"type":"zly"}}}' > "$R/.git/wt-profiles.json"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles check 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "profiles check błąd exit != 0" || bad "profiles check przepuścił błąd"
+contains "profiles check komunikat" "$out" "actions.s [projekt]"
+rm -f "$R/.git/wt-profiles.json"; rm -rf "$PX"
+check_fail "profiles zła podkomenda" $WT profiles bogus
+
+echo "-- profiles: wt new z akcjami"
+PX=$(mktemp -d); mkdir -p "$PX/wt"
+cat > "$PX/wt/profiles.json" <<'JSON'
+{"version": 1, "defaultMode": "f",
+ "variables": {"greet": {"choices": ["hej", "siema"]}},
+ "modes": {
+   "f": {"actions": ["rules", "deps", "dev", "solo"]},
+   "ok": {"actions": ["rules"]},
+   "tm": {"actions": ["t"]}},
+ "actions": {
+   "rules": {"type": "file", "label": "Zasady", "path": "notes/RULES.md", "content": "{greet} {branch}\n"},
+   "deps": {"type": "shell", "label": "Zależności", "run": "echo instaluje; echo zle >&2; exit 3"},
+   "dev": {"type": "shell", "run": "touch dev-ran", "needs": ["deps"]},
+   "solo": {"type": "shell", "run": "printf '%s|%s' \"$WT_NAME\" \"$WT_MODE\" > solo-ran"},
+   "t": {"type": "tmux-session"}}}
+JSON
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new prof-a --no-fetch 2>&1); rc=$?
+P1="$R/.claude/worktrees/prof-a"
+[ "$rc" -eq 3 ] && ok "new z błędną akcją zwraca jej kod" || bad "new exit $rc: $out"
+check "worktree zostaje mimo błędu" test -d "$P1"
+[ "$(cat "$P1/notes/RULES.md" 2>/dev/null)" = "hej prof-a" ] && ok "akcja file z placeholderami" || bad "RULES.md: $(cat "$P1/notes/RULES.md" 2>&1)"
+check_fail "zależna akcja pominięta" test -e "$P1/dev-ran"
+[ "$(cat "$P1/solo-ran" 2>/dev/null)" = "prof-a|f" ] && ok "niezależna akcja wykonana z env" || bad "solo-ran: $(cat "$P1/solo-ran" 2>&1)"
+contains "podsumowanie błąd" "$out" "BŁĄD Zależności (kod 3)"
+contains "podsumowanie pominięta" "$out" "dev: pominięta (nie powiodło się: deps)"
+contains "output akcji w terminalu" "$out" "instaluje"
+st=$(cat "$P1/.wt-actions" 2>/dev/null)
+contains ".wt-actions tryb" "$st" "mode=f"
+contains ".wt-actions ok" "$st" "action.rules.status=ok"
+contains ".wt-actions failed" "$st" "action.deps.status=failed"
+contains ".wt-actions kod" "$st" "action.deps.code=3"
+contains ".wt-actions skipped" "$st" "action.dev.status=skipped"
+contains "log stderr" "$(cat "$P1/.wt-actions.log" 2>/dev/null)" "zle"
+[ -z "$(git -C "$P1" status --porcelain --ignored=no)" ] || [ "$(git -C "$P1" status --porcelain | grep -v -e dev-ran -e solo-ran)" = "" ] \
+  && ok "pliki akcji wykluczone z gita" || bad "status: $(git -C "$P1" status --porcelain)"
+rm -f "$P1/solo-ran"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new prof-b --no-fetch --mode ok --set greet=siema 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "new --mode --set exit 0" || bad "new --mode exit $rc: $out"
+[ "$(cat "$R/.claude/worktrees/prof-b/notes/RULES.md" 2>/dev/null)" = "siema prof-b" ] && ok "--set podstawia zmienną" || bad "--set"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new prof-c --no-fetch --skip deps 2>&1)
+contains "--skip pomija akcję" "$out" "Zależności: pominięta (--skip)"
+contains "--skip pomija zależne" "$out" "dev: pominięta (wymaga deps)"
+check_fail "nieznany tryb" env XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --mode zzz
+check_fail "zła wartość --set" env XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --set greet=zzz
+out=$(cd "$R" && PATH=/usr/bin:/bin XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --mode tm 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "akcje tmux bez tmux: błąd" || bad "akcje tmux bez tmux przeszły"
+contains "akcje tmux bez tmux: komunikat" "$out" "brak tmux w PATH"
+check_fail "bez worktree po błędzie profilu" test -e "$R/.claude/worktrees/prof-d"
+check_fail "bez gałęzi po błędzie profilu" git -C "$R" rev-parse --verify --quiet refs/heads/prof-d
+check_fail "--mode bez pliku profili" env XDG_CONFIG_HOME="$PX/nic" $WT new prof-e --no-fetch --mode f
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX/nic" $WT new prof-e --no-fetch 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "new bez profili jak dawniej" || bad "new bez profili exit $rc: $out"
+check_fail "bez profili brak .wt-actions" test -e "$R/.claude/worktrees/prof-e/.wt-actions"
+for w in prof-a prof-b prof-c prof-e; do git -C "$R" worktree remove --force ".claude/worktrees/$w" && git -C "$R" branch -q -D "$w"; done
+rm -rf "$PX"
+
+echo "-- profiles: tmux"
+if command -v tmux >/dev/null 2>&1; then
+  export WT_TMUX_SOCKET="wt-test-$$"
+  TM() { tmux -L "$WT_TMUX_SOCKET" "$@"; }
+  PX=$(mktemp -d); mkdir -p "$PX/wt"
+  cat > "$PX/wt/profiles.json" <<'JSON'
+{"version": 1, "defaultMode": "t",
+ "modes": {"t": {"actions": ["sess", "cl", "bad", "after"]}},
+ "actions": {
+   "sess": {"type": "tmux-session"},
+   "cl": {"type": "tmux-window", "window": "claude", "run": "sh -c 'read x; echo \"$x\" > ../typed-{name}'",
+          "beforeDrop": {"sendKeys": "koniec"}},
+   "bad": {"type": "shell", "run": "exit 4"},
+   "after": {"type": "tmux-window", "window": "git", "run": "sleep 300"}}}
+JSON
+  RN=$(basename "$R" | tr '.:' '--')
+  out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new tm-a --no-fetch 2>&1); rc=$?
+  PT="$R/.claude/worktrees/tm-a"
+  [ "$rc" -eq 4 ] && ok "tmux: kod nieudanej akcji shell" || bad "tmux new exit $rc: $out"
+  check "tmux: sesja istnieje" TM has-session -t "=$RN/tm-a"
+  wins=$(TM list-windows -t "=$RN/tm-a" -F '#{window_name}' 2>&1 | tr '\n' ' ')
+  contains "tmux: okna shell, claude, git" "$wins" "shell claude git"
+  pp=$(TM list-panes -t "=$RN/tm-a:shell" -F '#{pane_current_path}' 2>/dev/null)
+  [ "$(cd "$pp" 2>/dev/null && pwd -P)" = "$PT" ] && ok "tmux: katalog okna = worktree" || bad "tmux: katalog $pp"
+  contains "tmux: komunikat attach" "$out" "tmux attach -t '$RN/tm-a'"
+  contains ".wt-actions sesja" "$(cat "$PT/.wt-actions")" "tmux_session=$RN/tm-a"
+  contains ".wt-actions sendkeys" "$(cat "$PT/.wt-actions")" "action.cl.sendkeys=koniec"
+  out=$(cd "$R" && $WT drop tm-a --check 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop --check nie blokuje się na procesach sesji" || bad "drop --check exit $rc: $out"
+  contains "tmux: --check zapowiada zamknięcie" "$out" "sesja tmux do zamknięcia"
+  check "tmux: --check nie zamyka sesji" TM has-session -t "=$RN/tm-a"
+  sleep 1
+  out=$(cd "$R" && $WT drop tm-a 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop exit 0" || bad "tmux drop exit $rc: $out"
+  check_fail "tmux: sesja zamknięta" TM has-session -t "=$RN/tm-a"
+  check_fail "tmux: worktree usunięty" test -d "$PT"
+  contains "tmux: sendKeys wysłane" "$out" "wysyłam do okna"
+  [ "$(cat "$R/.claude/worktrees/typed-tm-a" 2>/dev/null)" = "koniec" ] && ok "tmux: program odebrał sendKeys" || bad "sendKeys nie dotarło"
+  # Session already gone: drop must still work quietly.
+  out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new tm-b --no-fetch --skip bad 2>&1)
+  TM kill-session -t "=$RN/tm-b" 2>/dev/null
+  out=$(cd "$R" && $WT drop tm-b 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop bez żywej sesji" || bad "drop bez sesji exit $rc: $out"
+  # A process outside the session still blocks the drop.
+  out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new tm-c --no-fetch --skip bad 2>&1)
+  (cd "$R/.claude/worktrees/tm-c" && exec sleep 30) & SP=$!
+  sleep 0.5
+  out=$(cd "$R" && $WT drop tm-c 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && ok "tmux: obcy proces blokuje drop" || bad "obcy proces nie zablokował"
+  check "tmux: sesja nietknięta po odmowie" TM has-session -t "=$RN/tm-c"
+  kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null
+  out=$(cd "$R" && $WT drop tm-c 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop po zakończeniu obcego procesu" || bad "drop tm-c exit $rc: $out"
+  # drop run from inside the worktree's own session is refused (it would kill itself).
+  out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new tm-d --no-fetch --skip bad 2>&1)
+  TM send-keys -t "=$RN/tm-d:shell" "cd '$R' && $WT drop tm-d > '$PX/in-sess.out' 2>&1; echo \$? > '$PX/in-sess.rc'" Enter
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -f "$PX/in-sess.rc" ] && break; sleep 0.3; done
+  [ "$(cat "$PX/in-sess.rc" 2>/dev/null)" = 1 ] && ok "tmux: drop z wnętrza sesji odmawia" || bad "drop z wnętrza: rc=$(cat "$PX/in-sess.rc" 2>&1)"
+  contains "tmux: komunikat w sesji" "$(cat "$PX/in-sess.out" 2>/dev/null)" "jesteś w sesji tmux"
+  check "tmux: sesja przeżyła odmowę" TM has-session -t "=$RN/tm-d"
+  out=$(cd "$R" && $WT drop tm-d 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop z zewnątrz po odmowie" || bad "drop tm-d exit $rc: $out"
+  TM kill-server 2>/dev/null
+  unset WT_TMUX_SOCKET
+  rm -rf "$PX"
+else
+  echo "  (pomijam: brak tmux)"
+fi
+
+echo "-- profiles: UI"
+out=$(python3 - "$UIBIN" <<'PY' 2>&1
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("wt_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("wt_ui", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+st = m.parse_actions("mode=f\naction.a.status=ok\naction.a.label=Zasady\ntmux_session=r/x\n"
+                     "action.b.status=failed\naction.b.code=3\naction.c.status=skipped\naction.c.reason=r\nśmieci\n")
+assert st["mode"] == "f" and st["session"] == "r/x", st
+assert [a["id"] for a in st["actions"]] == ["a", "b", "c"] and st["actions"][1]["code"] == "3", st
+assert st["actions"][0]["label"] == "Zasady" and st["actions"][2]["reason"] == "r"
+log = "=== a (shell) ===\nx\n=== a: kod 0 ===\n=== b (shell) ===\n1\n\n2\n3\n4\n=== b: kod 3 ===\n"
+assert m.log_tail(log, "b") == ["2", "3", "4"] and m.log_tail(log, "a") == ["x"] and m.log_tail(log, "z") == []
+assert m.new_args("f", {"model": "opus"}, {"model": "opus"}, []) == ["--mode", "f"]
+assert m.new_args("f", {"model": "opus", "k": "a"}, {"model": "sonnet", "k": "a"}, ["git"]) == \
+    ["--mode", "f", "--set", "model=sonnet", "--skip", "git"]
+row = {"path": "/p", "branch": "b"}
+assert m.open_menu_state(row, None, "ok", True)["t"][0] == "brak sesji"
+assert m.open_menu_state(row, None, "ok", True, "r/b", False)["t"][0] == "sesja zamknięta"
+assert m.open_menu_state(row, None, "ok", True, "r/b", True)["t"] is None
+assert m.load_profiles_module() is not None
+base = {"defaultMode": "a", "variables": {"v": {"choices": ["x", "y"], "default": "x"}},
+        "modes": {"a": {"actions": ["s"]}, "b": {"actions": []}}, "actions": {}, "prompts": {}}
+o = m.profile_override(None, base, base, {"defaultMode": "b", "variables": {"v": "y"}, "modes": {"a": []}})
+assert o == {"version": 1, "defaultMode": "b", "variables": {"v": {"choices": ["x", "y"], "default": "y"}},
+             "modes": {"a": {"actions": []}}}, o
+merged = dict(base, defaultMode="b")
+o = m.profile_override({"version": 1, "defaultMode": "b", "extra": 1}, base, merged, {"defaultMode": "a"})
+assert o == {"version": 1, "extra": 1}, o
+o = m.profile_override({"version": 1, "modes": {"a": {"actions": []}}}, base, base, {"modes": {"a": ["s"]}})
+assert o == {"version": 1}, o
+print("UI-PROFILES-OK")
+PY
+)
+contains "UI: parsery akcji" "$out" "UI-PROFILES-OK"
+PX=$(mktemp -d); mkdir -p "$PX/wt"
+printf '%s\n' '{"version":1,"defaultMode":"f","modes":{"f":{"actions":["s"]}},"actions":{"s":{"type":"shell","run":"touch ran"}}}' > "$PX/wt/profiles.json"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new np-a --no-fetch --no-profile 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "--no-profile exit 0" || bad "--no-profile exit $rc: $out"
+check_fail "--no-profile nie uruchamia akcji" test -e "$R/.claude/worktrees/np-a/ran"
+check_fail "--no-profile z --mode" env XDG_CONFIG_HOME="$PX" $WT new np-b --no-fetch --no-profile --mode f
+git -C "$R" worktree remove --force .claude/worktrees/np-a && git -C "$R" branch -q -D np-a
+rm -rf "$PX"
+
+UT=$(mkrepo); cp -R "$(dirname "$WT_BIN")" "$UT/bin"; printf 'import os\nprint("WT_CMD=" + os.environ["WT_CMD"])\n' > "$UT/bin/wt-ui"
+out=$(cd "$UT" && $SH ./bin/wt ui 2>&1)
+contains "ui: WT_CMD bezwzględny przy ./bin/wt" "$out" "WT_CMD=$(cd "$UT" && pwd -P)/bin/wt"
+rm -rf "$UT"
+
+echo "-- profiles: UI (pty)"
+PX=$(mktemp -d); mkdir -p "$PX/wt"
+printf '%s' '{"version":1,"defaultMode":"f","variables":{"greet":{"label":"Powitanie","choices":["hej","siema"]}},"modes":{"f":{"label":"Funkcja","description":"Funkcja z testem","actions":["rules","dep"]}},"actions":{"rules":{"type":"file","label":"Zasady","path":"R.md","content":"{greet}"},"dep":{"type":"shell","label":"Zależna","run":"touch dep-ran","needs":["rules"]}}}' > "$PX/wt/profiles.json"
+cat > "$PX/drive.py" <<'PY'
+import fcntl, os, pty, select, struct, sys, termios, time, re
+wt_bin, cwd = sys.argv[1:3]
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(cwd); os.environ["TERM"] = "xterm-256color"; os.environ["WT_UI_POLL"] = "0"
+    os.execvp(os.environ.get("WT_SH", "bash"), [os.environ.get("WT_SH", "bash"), wt_bin, "ui"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+buf = b""
+def pump(sec):
+    global buf
+    end = time.time() + sec
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try: d = os.read(fd, 65536)
+            except OSError: return
+            if not d: return
+            buf += d
+def send(s): os.write(fd, s.encode())
+def until(txt, to=8):
+    end = time.time() + to
+    while time.time() < end:
+        pump(0.2)
+        if txt.encode() in buf: return True
+    return False
+def mark(name, ok): print(("OK " if ok else "FAIL ") + name)
+pump(2)
+send("n"); pump(0.8)
+send("ui-a"); pump(0.3)
+send("\r"); pump(0.3); send("\r"); pump(0.8)
+mark("picker trybu", until("Tryb nowego worktree"))
+mark("opis trybu", until("Funkcja z testem"))
+send("\r"); pump(0.8)
+mark("formularz akcji", until("Akcje: Funkcja"))
+mark("zmienna", until("< hej >"))
+send(" "); pump(0.3)       # uncheck first action (Zasady)
+mark("zależna oznaczona", until("pominięta: wymaga odznaczonej"))
+send("j"); send("j"); pump(0.3); send("l"); pump(0.3)  # variable -> siema
+buf = b""
+send("\r")
+mark("wt new uruchomione", until("--set greet=siema", 10))
+mark("koniec", until("[koniec, kod 0]", 15))
+buf = b""
+send("\r")
+mark("panel akcji profilu", until("Akcje profilu", 6))
+send("q"); pump(1)
+PY
+UT=$(mkrepo)
+out=$(WT_SH="$SH" XDG_CONFIG_HOME="$PX" python3 "$PX/drive.py" "$WT_BIN" "$UT" 2>&1)
+for w in "picker trybu" "opis trybu" "formularz akcji" "zmienna" "zależna oznaczona" "wt new uruchomione" "koniec" "panel akcji profilu"; do
+  contains "UI pty: $w" "$out" "OK $w"
+done
+contains "UI pty: --skip z odznaczenia" "$(cat "$UT/.claude/worktrees/ui-a/.wt-actions" 2>/dev/null)" "action.rules.reason=pominięta (--skip)"
+rm -rf "$PX" "$UT"
+
+echo "-- profiles: UI ekran P (pty)"
+PX=$(mktemp -d); mkdir -p "$PX/wt"
+printf '%s' '{"version":1,"defaultMode":"a","variables":{"greet":{"label":"Powitanie","choices":["hej","siema"]}},"modes":{"a":{"label":"Alfa","actions":["s1","s2"]},"b":{"label":"Beta","actions":[]}},"actions":{"s1":{"type":"shell","label":"Pierwsza","run":"true"},"s2":{"type":"shell","label":"Druga","run":"true","needs":["s1"]}}}' > "$PX/wt/profiles.json"
+cat > "$PX/drivep.py" <<'PY'
+import fcntl, os, pty, select, struct, sys, termios, time
+wt_bin, cwd = sys.argv[1:3]
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(cwd); os.environ["TERM"] = "xterm-256color"; os.environ["WT_UI_POLL"] = "0"
+    os.execvp(os.environ.get("WT_SH", "bash"), [os.environ.get("WT_SH", "bash"), wt_bin, "ui"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+buf = b""
+def pump(sec):
+    global buf
+    end = time.time() + sec
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try: d = os.read(fd, 65536)
+            except OSError: return
+            if not d: return
+            buf += d
+def send(s): os.write(fd, s.encode())
+def until(txt, to=8):
+    end = time.time() + to
+    while time.time() < end:
+        pump(0.2)
+        if txt.encode() in buf: return True
+    return False
+def mark(name, ok): print(("OK " if ok else "FAIL ") + name)
+pump(2)
+send("P"); mark("ekran", until("Tryb domyślny"))
+send("l"); pump(0.4)                  # default mode a -> b
+send("j"); send("l"); pump(0.4)       # greet hej -> siema
+send("j"); send("\r"); pump(0.6)      # mode Alfa: edit actions
+mark("edytor akcji", until("Akcje trybu: Alfa"))
+send(" "); send("\r"); pump(0.6)      # drop s1 -> s2 needs s1 -> invalid
+send("s"); mark("błąd walidacji", until("nie zapisano", 4))
+send("\r"); pump(0.4)
+send("\r"); pump(0.6); send(" "); send("j"); send(" "); send("\r"); pump(0.6)  # s1 back on, s2 off
+buf = b""
+send("s"); mark("zapisane", until("profile zapisane", 4))
+send("q"); pump(1)
+PY
+UT=$(mkrepo)
+out=$(WT_SH="$SH" XDG_CONFIG_HOME="$PX" python3 "$PX/drivep.py" "$WT_BIN" "$UT" 2>&1)
+for w in "ekran" "edytor akcji" "błąd walidacji" "zapisane"; do
+  contains "UI P: $w" "$out" "OK $w"
+done
+got=$(python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print(d.get("defaultMode"), d["variables"]["greet"]["default"], d["modes"]["a"]["actions"], sorted(d))' "$UT/.git/wt-profiles.json" 2>&1)
+contains "UI P: minimalny zapis" "$got" "b siema ['s1'] ['defaultMode', 'modes', 'variables', 'version']"
+check "UI P: wt profiles check po zapisie" sh -c "cd '$UT' && XDG_CONFIG_HOME='$PX' $WT profiles check"
+rm -rf "$PX" "$UT"
 
 echo
 echo "WYNIK: $PASS ok, $FAIL fail"

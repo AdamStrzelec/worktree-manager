@@ -20,8 +20,9 @@ Cel: fizyczna izolacja plików między równoległymi sesjami (każdy feature we
 | cfg | `wt config set/unset/--porcelain`, ekran Config w UI (`C`), `E` = `.git/wt.conf` w `$EDITOR` | gotowe |
 | 7 | `WT_COPY` (kopie zamiast symlinków) | gotowe |
 | 8 | Hooki `WT_PRE_DROP` / `WT_POST_DROP` | gotowe |
+| prof | Profile (`docs/spec-profiles.md`): `wt profiles`, `wt new --mode/--set/--skip/--no-profile`, akcje `file`/`shell`/`tmux-session`/`tmux-window`, zamykanie tmux w `wt drop`, UI (`n`, `o`→`t`, `P`) | gotowe |
 
-Weryfikacja: 235 testów w skrypcie testowym (0 błędów) na bash 5.3 i na `/bin/bash` 3.2, `bash -n` oraz `shellcheck` bez uwag.
+Weryfikacja: 335 testów w skrypcie testowym (0 błędów) na bash 5.3 i na `/bin/bash` 3.2, `bash -n` oraz `shellcheck` bez uwag.
 
 ### Do zrobienia
 
@@ -80,6 +81,8 @@ Tylko to, co wynika z komend. Nigdy `git add -A`, `reset --hard`, `push` ani for
 | `wt config` | Pokazuje repo, bazę, katalog worktree oraz efektywne wartości wszystkich kluczy z informacją, skąd pochodzą. `--porcelain`: TSV `klucz, źródło, wartość, domyślna` (bez nagłówka) |
 | `wt config set KLUCZ WARTOŚĆ` / `unset KLUCZ` | Zapis i usuwanie klucza w prywatnym `.git/wt.conf` (atomowo, komentarze zachowane, walidacja wartości; ostrzega, gdy wygrywa inne źródło, np. env) |
 | `wt drop <temat> [--check] [--merged-pr]` | Usuwa worktree (`git worktree remove`, bez force) i gałąź (`branch -d`, nigdy `-D`). Odmawia przy zmianach niezacommitowanych, żywym właścicielu, commitach niezmergowanych do targetu (`wt-target`, a bez niego bazy) albo gdy stoisz w tym worktree. Odmawia też, gdy w worktree działają procesy (wykrywane przez `lsof` po katalogu roboczym, np. `npm run dev`): wypisuje pid-y i kończy się błędem przed jakąkolwiek inną logiką, hookami i usuwaniem. `--stop-procs` wysyła im SIGTERM (czeka do 5 s, nigdy SIGKILL) i dopiero potem usuwa; jeśli się nie zatrzymają, nic nie jest usuwane. `--check` tylko sprawdza (też procesy), `--merged-pr` oznacza, że PR jest zmergowany na GitHubie. Odpala hooki `WT_PRE_DROP` / `WT_POST_DROP` |
+| `wt new … [--mode M] [--set VAR=WART] [--skip AKCJA] [--no-profile]` | Z profilem: plan akcji liczony i walidowany przed `git worktree add`; akcje po utworzeniu, przed `WT_POST_NEW`. Błąd akcji pomija tylko zależne; kod wyjścia = pierwszy błąd |
+| `wt profiles [list\|check]` | Pokazuje scalone profile (źródło każdego klucza) albo tylko waliduje |
 | `wt ui` | Interfejs w terminalu (sekcja 5) |
 | `wt` (bez argumentu) / nieznana komenda | Help na stderr (lista komend plus ścieżka repo), `exit 1` |
 
@@ -121,12 +124,7 @@ Format: `KLUCZ=wartość`, jedna para na linię, komentarze `#`, opcjonalne cudz
 
 Hooki `drop` dostają zmienne `WT_NAME`, `WT_PATH`, `WT_BRANCH`, `WT_MAIN` i działają z głównego checkoutu (worktree jest wtedy usuwane). `wt drop --check` ich nie uruchamia. Działają też, gdy drop idzie z UI (`x`, `M`).
 
-Przepis: sesja tmux o nazwie worktree, tworzona i zabijana razem z nim (domyślnie nic takiego się nie dzieje):
-
-```
-WT_POST_NEW=tmux new-session -d -s "$(basename "$PWD")" -c "$PWD"
-WT_POST_DROP=tmux kill-session -t "$WT_NAME" 2>/dev/null; true
-```
+Sesja tmux tworzona i zamykana razem z worktree: profil z akcjami `tmux-session` / `tmux-window` (`examples/profiles.json`, README "Profile"). `wt drop` wysyła `beforeDrop.sendKeys`, zamyka sesję i dobija tylko jej procesy.
 
 Edycja configu bez ręcznego pliku: `wt config set KLUCZ WARTOŚĆ`, `wt config unset KLUCZ` albo ekran Config w `wt ui` (`C`). Zapis idzie zawsze do prywatnego `.git/wt.conf`; wspólnego `.wt.conf` UI nie rusza. Zmiana `WT_DIR` domyślnie nie przenosi istniejących worktree (`wt list` bierze je z `git worktree list`, więc nic się nie gubi). Z `wt config set WT_DIR <ścieżka> --move` (w UI: pytanie po zmianie `WT_DIR`) `wt` przenosi przez `git worktree move` wszystkie worktree leżące w starym katalogu. Przed zapisem odmawia, gdy cel już istnieje, worktree jest zajęte (żywy `.wt-owner`) albo zablokowane; worktree spoza starego katalogu zostają. Niedziałające przeniesienie jednego worktree nie cofa pozostałych, tylko je wylicza z błędem.
 
@@ -167,6 +165,8 @@ WT_POST_NEW=npm install
 | `<worktree>/.wt-owner` | JSON: `session` (z `CLAUDE_SESSION_ID`), `pid` (to `$PPID`, czyli proces nadrzędny wywołujący `wt`, bo samo `wt` kończy się od razu), `pane` (z `TMUX_PANE`), `time`, `user` |
 | `<worktree>/<link>` | symlinki do plików z `WT_LINK` |
 | `<repo>/.git/info/exclude` | `.wt-owner`, `/<link>` dla każdego utworzonego symlinku (wzorzec `node_modules/` z `.gitignore` nie dopasowuje symlinka), a gdy `WT_DIR` leży w repo także `/<WT_DIR>/`. Wpisy są wspólne dla wszystkich worktree tego repo. Zapis chroniony blokadą `mkdir` (macOS nie ma `flock`) |
+| `<worktree>/.wt-actions`, `.wt-actions.log` | stan akcji profilu (tryb, sesja tmux, status każdej akcji) i ich wyjście; czytane przez `wt drop` i UI |
+| `<repo>/.git/wt-profiles.json` | profile projektu (zapis z ekranu `P`) |
 | `<repo>/.git/wt.lock` | chwilowy katalog blokady, usuwany po zapisie |
 
 ## 5. `wt ui`
@@ -180,10 +180,11 @@ Lista worktree po lewej (3 wiersze na pozycję: gałąź, PR/CI, ahead/brudne/wi
 | `n` | modal nowego worktree (nazwa, target branch, tytuł) |
 | `t` | testy w sfokusowanym worktree |
 | `c` | podmenu Kopiuj (`pbcopy`): `c` kopiuje `cd <ścieżka>`, `u` kopiuje URL PR (wyłączone, gdy brak PR), `h`/`Esc` wstecz |
-| `o` | podmenu Otwórz: `c` otwiera worktree w VS Code (`code`, a bez niego `open -a "Visual Studio Code"`), `b` otwiera PR gałęzi w przeglądarce, `t` sesja tmux (na razie wyłączone), `h`/`Esc` wstecz |
+| `o` | podmenu Otwórz: `c` otwiera worktree w VS Code (`code`, a bez niego `open -a "Visual Studio Code"`), `b` otwiera PR gałęzi w przeglądarce, `t` sesja tmux worktree (z profilu; w tmux `switch-client`, poza nim `attach`, a po odłączeniu wraca do UI), `h`/`Esc` wstecz |
 | `p` | podmenu PR: `p` push / utwórz PR (draft), `d` draft <-> ready, `m` merge PR, `M` merge + usuń worktree, `c` zamknij PR. Niedostępne opcje są wygaszone zgodnie ze stanem PR |
 | `x` | `wt drop` (z `--merged-pr`, gdy PR zmergowany) |
 | `C` | ekran konfiguracji: `j`/`k`, `Enter` edytuj klucz, `d` przywróć domyślną, `E` otwórz `.git/wt.conf` w `$VISUAL`/`$EDITOR`, `Esc` wróć |
+| `P` | ekran profili: `j`/`k`, `←`/`→` zmień tryb domyślny lub wartość zmiennej, `Enter` na trybie edytuje jego akcje (`Space` wł/wył, `J`/`K` kolejność), `s` zapisz do `.git/wt-profiles.json` (tylko różnice względem globalnego pliku, walidacja przed zapisem), `Esc` wyjdź |
 | `/`, `r`, `Esc` | filtr, odśwież (+ fetch), wyczyść filtr |
 | `U` | pobierz zmiany do głównego checkoutu (`git pull --ff-only`, z potwierdzeniem; odmawia, gdy main ma lokalne commity) |
 | `R` | włącza/wyłącza autoodświeżanie w tej sesji (autoodświeżanie nie robi `git fetch`) |

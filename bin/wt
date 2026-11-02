@@ -241,12 +241,14 @@ usage() {
   {
     printf 'Użycie: wt <komenda> [argumenty]\n\n'
     printf '  new <temat> [--no-fetch] nowy worktree i gałąź od (zaktualizowanej) bazy\n'
+    printf '      [--mode <tryb>] [--set zmienna=wartość] [--skip <akcja>] [--no-profile]  akcje z profili\n'
     printf '  list | ls               tabela worktree\n'
     printf '  status                  kolizje plików między worktree\n'
     printf '  test [args]             testy w bieżącym worktree\n'
     printf '  merge <temat>           testy, rebase, testy, merge --ff-only\n'
     printf '  drop <temat>            usuń worktree i gałąź (tylko gdy bezpieczne)\n'
     printf '  ui                      interfejs w terminalu (curses)\n'
+    printf '  profiles [list|check]   tryby i akcje z plików profili\n'
     printf '  config [set|unset|--porcelain] konfiguracja i jej źródła\n\n'
     printf 'Repo: %s\n' "${repo:-(poza repo git)}"
   } >&2
@@ -604,10 +606,15 @@ sync_base() {
 
 cmd_new() {
   local name="" path f post_rc=0 rel hash do_fetch=1 target="" title=""
-  local usage="użycie: wt new <temat> [--target <gałąź>] [--title <tytuł>] [--no-fetch]"
+  local mode="" sets="" skips="" plan plan_rc=0 nl=$'\n' no_profile=0
+  local usage="użycie: wt new <temat> [--target <gałąź>] [--title <tytuł>] [--no-fetch] [--mode <tryb>] [--set zmienna=wartość]... [--skip <akcja>]... [--no-profile]"
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-fetch) do_fetch=0 ;;
+      --mode)     [ $# -ge 2 ] || die "$usage"; mode=$2; shift ;;
+      --no-profile) no_profile=1 ;;
+      --set)      [ $# -ge 2 ] || die "$usage"; sets="$sets$2$nl"; shift ;;
+      --skip)     [ $# -ge 2 ] || die "$usage"; skips="$skips$2$nl"; shift ;;
       --target)   [ $# -ge 2 ] || die "$usage"; target=$2; shift ;;
       --title)    [ $# -ge 2 ] || die "$usage"; title=$2; shift ;;
       -*)         die "nieznana opcja: $1" ;;
@@ -637,6 +644,20 @@ cmd_new() {
 
   if [ "$do_fetch" = 1 ] && [ "$CFG_WT_FETCH" != 0 ]; then
     sync_base
+  fi
+
+  # Resolve profiles before creating anything: a bad profile or argument leaves no trace.
+  plan=$(mktemp "${TMPDIR:-/tmp}/wt-plan.XXXXXX") || die "mktemp nie powiodło się"
+  # shellcheck disable=SC2064
+  trap "rm -f '$plan'" EXIT
+  if [ "$no_profile" = 1 ]; then
+    [ -z "$mode$sets$skips" ] || die "--no-profile wyklucza --mode/--set/--skip"
+    : > "$plan"
+  else
+    profiles_resolve "$plan" "$name" "$path" "$mode" "$sets" "$skips"
+  fi
+  if [ -s "$plan" ] && [ -z "$mode" ]; then
+    mode=$(profiles_helper default-mode) || die "profile: nie udało się odczytać domyślnego trybu"
   fi
 
   git -C "$MAIN" worktree add -q -b "$name" "$path" "$BASE" || die "git worktree add nie powiodło się"
@@ -678,6 +699,8 @@ cmd_new() {
     "$MAIN"/*) rel=${WT_ROOT#"$MAIN"}; add_exclude "$rel/" ;;
   esac
 
+  run_plan "$path" "$name" "$plan" "$mode" || plan_rc=$?
+
   if [ -n "$CFG_WT_POST_NEW" ]; then
     info "uruchamiam WT_POST_NEW: $CFG_WT_POST_NEW"
     (cd "$path" && bash -c "$CFG_WT_POST_NEW") || post_rc=$?
@@ -687,6 +710,7 @@ cmd_new() {
   hash=$(git -C "$MAIN" rev-parse --short "$BASE")
   info "gałąź: $name (od $BASE @ $hash)"
   info "cd $path"
+  [ "$plan_rc" -ne 0 ] && return "$plan_rc"
   return "$post_rc"
 }
 
@@ -860,9 +884,9 @@ cmd_test() {
   top=$(git rev-parse --show-toplevel) || die "nie udało się ustalić korzenia repo"
   run_tests "$top" "$@"
 }
-# cmd_ui - launch the curses UI (bin/wt-ui next to this script, symlinks resolved).
-cmd_ui() {
-  local src=$0 dir link
+# script_src - print the real path of this script (symlinks resolved; helpers live next to it).
+script_src() {
+  local src=$0 link
   while [ -L "$src" ]; do
     link=$(readlink "$src")
     case "$link" in
@@ -870,10 +894,49 @@ cmd_ui() {
       *)  src="$(dirname "$src")/$link" ;;
     esac
   done
+  printf '%s' "$src"
+}
+
+# cmd_ui - launch the curses UI (bin/wt-ui next to this script, symlinks resolved).
+# WT_CMD must be absolute: the UI runs `wt` from other directories (e.g. the main checkout).
+cmd_ui() {
+  local src dir
+  src=$(script_src)
   dir=$(cd "$(dirname "$src")" && pwd -P)
   [ -f "$dir/wt-ui" ] || die "brak pliku $dir/wt-ui"
   command -v python3 >/dev/null 2>&1 || die "wt ui wymaga python3"
-  WT_CMD="$src" exec python3 "$dir/wt-ui" "$@"
+  WT_CMD="$dir/$(basename "$src")" exec python3 "$dir/wt-ui" "$@"
+}
+
+# Profile files: global defaults and per-repo overrides (both trusted, never committed).
+profiles_global() { printf '%s' "${XDG_CONFIG_HOME:-$HOME/.config}/wt/profiles.json"; }
+profiles_project() { printf '%s' "$MAIN/.git/wt-profiles.json"; }
+
+# profiles_helper ARGS... - run bin/wt-profiles with both profile files.
+profiles_helper() {
+  local dir
+  dir=$(cd "$(dirname "$(script_src)")" && pwd -P)
+  [ -f "$dir/wt-profiles" ] || die "brak pliku $dir/wt-profiles"
+  command -v python3 >/dev/null 2>&1 || die "profile wymagają python3"
+  local cmd=$1; shift
+  python3 "$dir/wt-profiles" "$cmd" --global "$(profiles_global)" --project "$(profiles_project)" "$@"
+}
+
+# cmd_profiles - show merged profiles (list) or validate them (check).
+cmd_profiles() {
+  local sub=${1:-list}
+  case "$sub" in
+    list|check) ;;
+    *) die "użycie: wt profiles [list|check]" ;;
+  esac
+  repo_main
+  if [ ! -f "$(profiles_global)" ] && [ ! -f "$(profiles_project)" ]; then
+    info "brak plików profili"
+    info "  globalne: $(profiles_global)"
+    info "  projekt:  $(profiles_project)"
+    return 0
+  fi
+  profiles_helper "$sub" || exit 1
 }
 cmd_merge()  { not_implemented merge; }
 # find_worktree BRANCH - print the path of the (non-main) worktree on BRANCH, or return 1.
@@ -957,8 +1020,27 @@ cmd_drop() {
   here=$(pwd -P)
   case "$here/" in "$wpath"/*) die "stoisz w tym worktree, przejdź do innego katalogu" ;; esac
 
-  # Running processes (dev servers etc.) block the drop before any other check or action.
+  # The worktree's own tmux session (from profiles) is closed by drop, so its processes don't block.
+  local session sess_pids="" line
+  # Process list first, session tree second: children spawned in between are still caught.
   procs=$(wt_procs "$wpath")
+  session=$(actions_get "$wpath" tmux_session)
+  if [ -n "$session" ] && tmux_session_alive "$session"; then
+    sess_pids=$(tmux_session_pids "$session")
+    # wt itself descends from a pane of that session: killing it would kill this drop half-way.
+    if printf '%s\n' "$sess_pids" | grep -qx "$$"; then
+      die "jesteś w sesji tmux '$session' tego worktree; uruchom drop z innej sesji lub terminala"
+    fi
+  else
+    session=""
+  fi
+
+  # Running processes (dev servers etc.) block the drop before any other check or action.
+  if [ -n "$sess_pids" ]; then
+    procs=$(filter_procs "$procs" "$sess_pids" | while IFS= read -r line; do
+      kill -0 "${line%%$'\t'*}" 2>/dev/null && printf '%s\n' "$line"
+    done)
+  fi
   if [ -n "$procs" ] && [ "$stop" != 1 ]; then
     printf 'wt: w worktree "%s" działają procesy:\n' "$name" >&2
     while IFS=$'\t' read -r pid cmd; do printf '  pid %s  %s\n' "$pid" "$cmd" >&2; done <<WTEOF
@@ -993,10 +1075,12 @@ WTEOF
     || die "gałąź '$name' nie jest zmergowana lokalnie (do upstreamu lub HEAD głównego checkoutu); zrób fetch/pull targetu"
 
   if [ "$check" = 1 ]; then
+    [ -n "$session" ] && info "sesja tmux do zamknięcia: $session"
     info "można usunąć: $name"
     return 0
   fi
   if [ -n "$procs" ]; then stop_procs "$procs"; fi
+  [ -n "$session" ] && close_tmux_session "$wpath"
   # Hooks get the worktree identity via env; they run from the main checkout (the worktree is going away).
   if [ -n "$CFG_WT_PRE_DROP" ]; then
     info "uruchamiam WT_PRE_DROP: $CFG_WT_PRE_DROP"
@@ -1017,6 +1101,244 @@ WTEOF
   info "usunięto worktree i gałąź: $name"
 }
 
+# ------------------------------------------------------------------- tmux ---
+
+# wt_tmux ARGS... - tmux, on a private server when WT_TMUX_SOCKET is set (tests).
+wt_tmux() {
+  if [ -n "${WT_TMUX_SOCKET:-}" ]; then tmux -L "$WT_TMUX_SOCKET" "$@"; else tmux "$@"; fi
+}
+
+# actions_get PATH KEY - value of KEY from <worktree>/.wt-actions (empty when missing).
+actions_get() {
+  local k v
+  [ -f "$1/.wt-actions" ] || return 0
+  while IFS='=' read -r k v; do
+    if [ "$k" = "$2" ]; then printf '%s' "$v"; return 0; fi
+  done < "$1/.wt-actions"
+}
+
+# tmux_session_alive NAME - true when tmux runs and has exactly this session.
+tmux_session_alive() {
+  command -v tmux >/dev/null 2>&1 && wt_tmux has-session -t "=$1" 2>/dev/null
+}
+
+# tmux_session_pids NAME - pids of all pane processes of the session and their descendants.
+tmux_session_pids() {
+  local roots
+  roots=$(wt_tmux list-panes -s -t "=$1" -F '#{pane_pid}' 2>/dev/null) || return 0
+  [ -n "$roots" ] || return 0
+  # BSD awk rejects newlines in -v values, so lists are passed space-separated.
+  ps -A -o pid= -o ppid= | awk -v roots="$(printf '%s' "$roots" | tr '\n' ' ')" '
+    BEGIN { n = split(roots, r, " "); for (i = 1; i <= n; i++) keep[r[i]] = 1 }
+    { parent[$1] = $2 }
+    END {
+      changed = 1
+      while (changed) { changed = 0
+        for (p in parent) if (!(p in keep) && (parent[p] in keep)) { keep[p] = 1; changed = 1 } }
+      for (p in keep) print p }'
+}
+
+# filter_procs PROCS PIDS - drop lines of PROCS ("pid<TAB>cmd") whose pid is in PIDS (newline list).
+filter_procs() {
+  printf '%s\n' "$1" | awk -F '\t' -v pids="$(printf '%s' "$2" | tr '\n' ' ')" '
+    BEGIN { n = split(pids, a, " "); for (i = 1; i <= n; i++) skip[a[i]] = 1 }
+    NF && !($1 in skip)'
+}
+
+# close_tmux_session WPATH - send beforeDrop keys, kill the worktree's session, wait for its processes.
+close_tmux_session() {
+  local wpath=$1 session k v pids i alive pid win
+  session=$(actions_get "$wpath" tmux_session)
+  [ -n "$session" ] && tmux_session_alive "$session" || return 0
+  pids=$(tmux_session_pids "$session")
+  while IFS='=' read -r k v; do
+    case "$k" in
+      action.*.sendkeys)
+        win=$(actions_get "$wpath" "${k%.sendkeys}.window")
+        [ -n "$win" ] && [ -n "$v" ] || continue
+        info "wysyłam do okna $win: $v"
+        wt_tmux send-keys -t "$win" -l "$v" 2>/dev/null && wt_tmux send-keys -t "$win" Enter 2>/dev/null
+        ;;
+    esac
+  done < "$wpath/.wt-actions"
+  # Give programs that got beforeDrop keys a moment to exit cleanly.
+  if grep -q '^action\..*\.sendkeys=' "$wpath/.wt-actions"; then sleep 1; fi
+  info "zamykam sesję tmux: $session"
+  wt_tmux kill-session -t "=$session" 2>/dev/null
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    alive=""
+    for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive="$alive $pid"; done
+    [ -z "$alive" ] && return 0
+    sleep 0.3
+  done
+  for pid in $alive; do kill "$pid" 2>/dev/null; done
+  return 0
+}
+
+# run_tmux_session PATH SESSION - create a detached session (window "shell") unless it already exists.
+run_tmux_session() {
+  if tmux_session_alive "$2"; then
+    info "    sesja tmux $2 już istnieje"
+    return 0
+  fi
+  wt_tmux new-session -d -s "$2" -n shell -c "$1"
+}
+
+# run_tmux_window PATH SESSION NAME RUN - new window; RUN is typed into its shell. Prints window id.
+run_tmux_window() {
+  local wid
+  wid=$(wt_tmux new-window -d -P -F '#{window_id}' -t "=$2:" -n "$3" -c "$1") || return 1
+  if [ -n "$4" ]; then
+    wt_tmux send-keys -t "$wid" -l "$4" && wt_tmux send-keys -t "$wid" Enter || return 1
+  fi
+  printf '%s' "$wid"
+}
+
+# ---------------------------------------------------------- profile actions --
+
+# profiles_resolve PLANFILE NAME PATH MODE SETS SKIPS - write the NUL plan for `wt new`.
+# SETS/SKIPS are newline-separated lists. Returns 0 with an empty plan when no profiles exist.
+profiles_resolve() {
+  local plan=$1 name=$2 path=$3 mode=$4 sets=$5 skips=$6 item types="file shell"
+  command -v tmux >/dev/null 2>&1 && types="$types tmux-session tmux-window"
+  set --
+  [ -n "$mode" ] && set -- "$@" --mode "$mode"
+  while IFS= read -r item; do [ -n "$item" ] && set -- "$@" --set "$item"; done <<EOF_SETS
+$sets
+EOF_SETS
+  while IFS= read -r item; do [ -n "$item" ] && set -- "$@" --skip "$item"; done <<EOF_SKIPS
+$skips
+EOF_SKIPS
+  if [ ! -f "$(profiles_global)" ] && [ ! -f "$(profiles_project)" ]; then
+    [ $# -eq 0 ] || die "--mode/--set/--skip wymagają pliku profili ($(profiles_global) lub $(profiles_project))"
+    : > "$plan"
+    return 0
+  fi
+  profiles_helper resolve --name "$name" --branch "$name" --path "$path" --base "$BASE" \
+    --repo "$(basename "$MAIN")" --types "$types" "$@" > "$plan" || die "profile: błąd, worktree nie został utworzony"
+}
+
+# record_action PATH ID STATUS [KEY VALUE]... - append status lines to <worktree>/.wt-actions.
+record_action() {
+  local path=$1 id=$2 status=$3
+  shift 3
+  printf 'action.%s.status=%s\n' "$id" "$status" >> "$path/.wt-actions"
+  while [ $# -ge 2 ]; do
+    printf 'action.%s.%s=%s\n' "$id" "$1" "$(printf '%s' "$2" | tr '\n\r\t' '   ')" >> "$path/.wt-actions"
+    shift 2
+  done
+}
+
+# run_file_action PATH REL CONTENT - create REL inside the worktree (never overwrite, never escape).
+run_file_action() {
+  local path=$1 rel=$2 content=$3 dir real
+  if [ -e "$path/$rel" ] || [ -L "$path/$rel" ]; then
+    info "    plik $rel już istnieje, nie nadpisuję"
+    return 0
+  fi
+  dir=$(dirname "$path/$rel")
+  mkdir -p "$dir" || return 1
+  real=$(cd "$dir" && pwd -P) || return 1
+  case "$real/" in
+    "$(cd "$path" && pwd -P)"/*) ;;
+    *) printf 'wt: %s wychodzi poza worktree (symlink)\n' "$rel" >&2; return 1 ;;
+  esac
+  printf '%s' "$content" > "$path/$rel" || return 1
+  add_exclude "/$rel"
+}
+
+# run_plan PATH NAME PLANFILE MODE - run profile actions; independent actions continue after a failure.
+# Prints a summary; returns the exit code of the first failed action (0 when none failed).
+run_plan() {
+  local path=$1 name=$2 plan=$3 mode=$4 f key kind="" id="" rc=0 arc ok_ids=" " summary="" n missing
+  local a_type a_label a_needs a_path a_content a_run a_window a_keys a_session a_attach reason
+  local log="$path/.wt-actions.log" session="" attach="" wid
+  [ -s "$plan" ] || return 0
+  printf 'mode=%s\n' "$mode" > "$path/.wt-actions"
+  : > "$log"
+  add_exclude ".wt-actions"
+  add_exclude ".wt-actions.log"
+  info "akcje profilu:"
+  while IFS= read -r -d '' f; do
+    if [ -z "$kind" ]; then
+      kind=$f; id=""; key=""; a_type=""; a_label=""; a_needs=""; a_path=""; a_content=""; a_run=""; reason=""
+      a_window=""; a_keys=""; a_session=""; a_attach=""
+      continue
+    fi
+    if [ -z "$id" ]; then id=$f; continue; fi
+    if [ -z "$key" ]; then
+      if [ -n "$f" ]; then key=$f; continue; fi
+      # End of record: run it.
+      [ -z "$a_label" ] && a_label=$id
+      if [ "$kind" = skip ]; then
+        record_action "$path" "$id" skipped label "$a_label" reason "$reason"
+        summary="$summary  -    $a_label: $reason"$'\n'
+        kind=""; continue
+      fi
+      missing=""
+      for n in $a_needs; do
+        case "$ok_ids" in *" $n "*) ;; *) missing="$missing $n" ;; esac
+      done
+      if [ -n "$missing" ]; then
+        reason="pominięta (nie powiodło się:$missing)"
+        record_action "$path" "$id" skipped label "$a_label" reason "$reason"
+        summary="$summary  -    $a_label: $reason"$'\n'
+        kind=""; continue
+      fi
+      info "  > $a_label"
+      printf '=== %s (%s) ===\n' "$id" "$a_type" >> "$log"
+      arc=0
+      case "$a_type" in
+        file)  run_file_action "$path" "$a_path" "$a_content" 2>> "$log" || arc=$? ;;
+        shell)
+          (cd "$path" && WT_NAME=$name WT_PATH=$path WT_BRANCH=$name WT_MAIN=$MAIN WT_MODE=$mode \
+            bash -c "$a_run") 2>&1 | tee -a "$log"
+          arc=${PIPESTATUS[0]} ;;
+        tmux-session)
+          run_tmux_session "$path" "$a_session" 2>> "$log" || arc=$?
+          if [ "$arc" -eq 0 ]; then
+            session=$a_session
+            printf 'tmux_session=%s\n' "$session" >> "$path/.wt-actions"
+            [ "$a_attach" = 1 ] && attach=1
+          fi ;;
+        tmux-window)
+          wid=$(run_tmux_window "$path" "$session" "$a_window" "$a_run" 2>> "$log") || arc=1
+          [ -n "$wid" ] && printf 'action.%s.window=%s\n' "$id" "$wid" >> "$path/.wt-actions"
+          [ -n "$wid" ] && [ -n "$a_keys" ] \
+            && printf 'action.%s.sendkeys=%s\n' "$id" "$(printf '%s' "$a_keys" | tr '\n\r\t' '   ')" >> "$path/.wt-actions" ;;
+      esac
+      printf '=== %s: kod %s ===\n' "$id" "$arc" >> "$log"
+      if [ "$arc" -eq 0 ]; then
+        ok_ids="$ok_ids$id "
+        record_action "$path" "$id" ok label "$a_label"
+        summary="$summary  ok   $a_label"$'\n'
+      else
+        [ "$rc" -eq 0 ] && rc=$arc
+        record_action "$path" "$id" failed label "$a_label" code "$arc"
+        summary="$summary  BŁĄD $a_label (kod $arc)"$'\n'
+      fi
+      kind=""; continue
+    fi
+    case "$key" in
+      type) a_type=$f ;; label) a_label=$f ;; needs) a_needs=$f ;; path) a_path=$f ;;
+      content) a_content=$f ;; run) a_run=$f ;; reason) reason=$f ;; window) a_window=$f ;;
+      beforeDrop.sendKeys) a_keys=$f ;; session) a_session=$f ;; attach) a_attach=$f ;;
+    esac
+    key=""
+  done < "$plan"
+  info "podsumowanie akcji (tryb $mode):"
+  printf '%s' "$summary"
+  [ "$rc" -ne 0 ] && info "UWAGA: część akcji się nie powiodła; log: $log (worktree zostaje)" >&2
+  if [ -n "$session" ]; then
+    if [ "$attach" = 1 ] && [ -n "${TMUX:-}" ]; then
+      wt_tmux switch-client -t "=$session" 2>/dev/null || info "tmux attach -t '$session'"
+    else
+      info "sesja tmux: tmux attach -t '$session'"
+    fi
+  fi
+  return "$rc"
+}
+
 # ----------------------------------------------------------------- main -----
 
 case "${1:-}" in
@@ -1028,5 +1350,6 @@ case "${1:-}" in
   drop)        shift; cmd_drop "$@" ;;
   config)      shift; cmd_config "$@" ;;
   ui)          shift; cmd_ui "$@" ;;
+  profiles)    shift; cmd_profiles "$@" ;;
   *)           usage ;;
 esac
