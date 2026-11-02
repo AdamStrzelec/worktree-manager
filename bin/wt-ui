@@ -415,11 +415,92 @@ def commit_mark(sha, local):
     return ("✓", "green")
 
 
-def open_menu_state(row, pr, pr_status, has_gh):
-    """Availability of the Open submenu keys: {key: None | (short, full)}; None = enabled. Pure."""
-    # tmux: placeholder until `wt new` creates a tmux session per worktree.
-    return {"c": None, "b": pr_url_block(row, pr, pr_status, has_gh),
-            "t": ("wkrótce", "Otwieranie w tmux jeszcze nie działa: wt new nie tworzy jeszcze sesji tmux dla worktree.")}
+def open_menu_state(row, pr, pr_status, has_gh, session=None, session_alive=False):
+    """Availability of the Open submenu keys: {key: None | (short, full)}; None = enabled. Pure.
+
+    session: tmux session name from the worktree's .wt-actions (None when profiles made none)."""
+    if not session:
+        tmux = ("brak sesji", "Ten worktree nie ma sesji tmux. Powstaje z profilu z akcją tmux-session (wt new --mode ...).")
+    elif not session_alive:
+        tmux = ("sesja zamknięta", f"Sesja tmux '{session}' nie działa (zamknięta ręcznie albo serwer tmux wyłączony).")
+    else:
+        tmux = None
+    return {"c": None, "b": pr_url_block(row, pr, pr_status, has_gh), "t": tmux}
+
+
+def parse_actions(text):
+    """Parse a worktree's .wt-actions: {"mode", "session", "actions": [{"id", "status", "label", ...}]}. Pure."""
+    res = {"mode": "", "session": "", "actions": []}
+    by_id = {}
+    for line in text.splitlines():
+        key, sep, val = line.partition("=")
+        if not sep:
+            continue
+        if key == "mode":
+            res["mode"] = val
+        elif key == "tmux_session":
+            res["session"] = val
+        elif key.startswith("action."):
+            aid, _, field = key[len("action."):].rpartition(".")
+            if not aid:
+                continue
+            if aid not in by_id:
+                by_id[aid] = {"id": aid}
+                res["actions"].append(by_id[aid])
+            by_id[aid][field] = val
+    return res
+
+
+def log_tail(log, aid, n=3):
+    """Last n non-empty output lines of action aid in .wt-actions.log. Pure.
+
+    Sections start with "=== <id> (<type>) ===" and end with "=== <id>: kod <n> ===" (written by bin/wt)."""
+    out, inside = [], False
+    for line in log.splitlines():
+        if line.startswith(f"=== {aid}: kod "):
+            inside = False
+        elif line.startswith(f"=== {aid} (") and line.endswith(") ==="):
+            inside, out = True, []
+        elif inside and line.strip():
+            out.append(line)
+    return out[-n:]
+
+
+def new_args(mode, defaults, values, unchecked):
+    """Extra `wt new` arguments for a chosen mode: --mode, --set only for changed values, --skip. Pure."""
+    args = ["--mode", mode]
+    for k in sorted(values):
+        if values[k] != defaults.get(k):
+            args += ["--set", f"{k}={values[k]}"]
+    for a in unchecked:
+        args += ["--skip", a]
+    return args
+
+
+def load_profiles_module():
+    """Import bin/wt-profiles (next to this file, symlinks resolved); None when missing."""
+    import importlib.machinery
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.realpath(__file__)), "wt-profiles")
+    if not os.path.isfile(path):
+        return None
+    loader = importlib.machinery.SourceFileLoader("wt_profiles", path)
+    spec = importlib.util.spec_from_loader("wt_profiles", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+def profile_paths(main_path):
+    """(global, project) profile file paths, same as bin/wt."""
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(xdg, "wt", "profiles.json"), os.path.join(main_path, ".git", "wt-profiles.json")
+
+
+def tmux_argv(*args):
+    """tmux command honoring WT_TMUX_SOCKET (private server used by tests)."""
+    sock = os.environ.get("WT_TMUX_SOCKET")
+    return ["tmux"] + (["-L", sock] if sock else []) + list(args)
 
 
 def copy_menu_state(row, pr, pr_status, has_gh):
@@ -538,6 +619,7 @@ class App:
         self.message = ""
         self.pending_error = None
         self.detail_cache = {}
+        self.actions_cache = {}  # worktree path -> (mtime, parsed .wt-actions)
         self.show_help = False
         self.menu = "main"  # which Space menu is shown: main | pr
         self.menu_note = ""  # why the last pressed (disabled) menu entry is unavailable
@@ -1041,6 +1123,54 @@ class App:
         self.detail_cache[key] = lines
         return lines
 
+    def wt_actions(self, path):
+        """Parsed <worktree>/.wt-actions, re-read only when the file changes."""
+        f = os.path.join(path, ".wt-actions")
+        try:
+            mtime = os.stat(f).st_mtime_ns
+        except OSError:
+            return {"mode": "", "session": "", "actions": []}
+        hit = self.actions_cache.get(path)
+        if hit and hit[0] == mtime:
+            return hit[1]
+        try:
+            with open(f, encoding="utf-8", errors="replace") as fh:
+                data = parse_actions(fh.read())
+        except OSError:
+            data = {"mode": "", "session": "", "actions": []}
+        self.actions_cache[path] = (mtime, data)
+        return data
+
+    def action_lines(self, r):
+        """Detail-panel section with the status of profile actions run by `wt new` (empty without profiles)."""
+        st = self.wt_actions(r["path"])
+        if not st["actions"]:
+            return []
+        lines = [[(f"Akcje profilu (tryb {st['mode'] or '?'})", "accentb")]]
+        log = None
+        for a in st["actions"]:
+            label = a.get("label") or a["id"]
+            status = a.get("status")
+            if status == "ok":
+                lines.append([("  " + self.sym["ok"] + " ", "green"), (label, "plain")])
+            elif status == "failed":
+                lines.append([("  ✗ " if self.utf8 else "  x ", "redb"), (label, "plain"),
+                              (f"  (kod {a.get('code', '?')})", "red")])
+                if log is None:
+                    try:
+                        with open(os.path.join(r["path"], ".wt-actions.log"), encoding="utf-8", errors="replace") as fh:
+                            log = fh.read()
+                    except OSError:
+                        log = ""
+                for t in log_tail(log, a["id"]):
+                    lines.append([("      " + t, "red")])
+            else:
+                lines.append([("  - ", "dim"), (label, "dim"), ("  " + a.get("reason", ""), "dim")])
+        if st["session"]:
+            lines.append([("  tmux: ", "dim"), (st["session"], "accent"), ("  (o, t: otwórz)", "dim")])
+        lines.append([])
+        return lines
+
     def pr_badge(self, branch):
         """(text, style) parts for the PR column: 'PR #50 draft', CI icon; None when gh is unavailable."""
         pr = self.prs.get(branch)
@@ -1069,6 +1199,8 @@ class App:
         Overlapping files between worktrees (wt status) are deliberately not shown: they are only
         potential conflicts and most of them merge cleanly."""
         notes = []
+        if any(a.get("status") == "failed" for a in self.wt_actions(r["path"])["actions"]):
+            notes.append("błąd akcji profilu")
         pr = self.prs.get(r["branch"])
         if pr and pr["state"] == "OPEN" and pr["mergeable"] == "CONFLICTING":
             notes.append("konflikt z targetem PR")
@@ -1217,6 +1349,7 @@ class App:
         elif self.pr_status == "ok":
             lines.append([lab("PR"), ("brak", "dim")])
         lines.append([])
+        lines += self.action_lines(r)
         lines += self.details(r)
         for i, parts in enumerate(lines[:ph - 2]):
             self.segs(y0 + 1 + i, x0 + 2, parts, iw)
@@ -1328,8 +1461,34 @@ class App:
     def sub_state(self, row):
         """Disabled entries of the current Open/Copy submenu for row."""
         pr = self.prs.get(row["branch"]) if row and row.get("branch") else None
-        fn = open_menu_state if self.menu == "open" else copy_menu_state
-        return fn(row, pr, self.pr_status, bool(shutil.which("gh")))
+        if self.menu == "open":
+            session = self.wt_actions(row["path"])["session"] if row else ""
+            alive = bool(session) and self.tmux_alive(session)
+            return open_menu_state(row, pr, self.pr_status, bool(shutil.which("gh")), session, alive)
+        return copy_menu_state(row, pr, self.pr_status, bool(shutil.which("gh")))
+
+    def tmux_alive(self, session):
+        if not shutil.which("tmux"):
+            return False
+        rc, _, _ = run(tmux_argv("has-session", "-t", "=" + session), timeout=5)
+        return rc == 0
+
+    def open_tmux(self, row):
+        """Switch to the worktree's tmux session (inside tmux) or attach to it (UI resumes on detach)."""
+        session = self.wt_actions(row["path"])["session"]
+        if os.environ.get("TMUX"):
+            rc, _, err = run(tmux_argv("switch-client", "-t", "=" + session), timeout=10)
+            self.message = f"tmux: {session}" if rc == 0 else "! tmux: " + clean_error(err, "switch-client nie powiodło się")
+            return
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            rc = subprocess.call(tmux_argv("attach-session", "-t", "=" + session))
+        except OSError:
+            rc = 1
+        curses.reset_prog_mode()
+        self.scr.refresh()
+        self.message = f"tmux: wrócono z {session}" if rc == 0 else f"! tmux attach: kod {rc}"
 
     def pr_state(self, row):
         return pr_menu_state(row, self.prs.get(row["branch"]), self.pr_status, bool(shutil.which("gh")))
@@ -1586,18 +1745,192 @@ class App:
                 f["focus"] = 2 if foc == 1 else foc
             f["pos"][foc] = pos
 
+    def load_profiles(self):
+        """(module, cfg, origin) for the repo's profiles; cfg None when there are none. Errors -> modal, None."""
+        if not self.main:
+            return None, None, {}
+        g, pj = profile_paths(self.main["path"])
+        if not os.path.isfile(g) and not os.path.isfile(pj):
+            return None, None, {}
+        mod = load_profiles_module()
+        if mod is None:
+            self.modal("Profile", "Brak pliku wt-profiles obok wt-ui.")
+            return None
+        try:
+            cfg, origin, _ = mod.load(g, pj)
+        except mod.ProfileError as e:
+            self.modal("Profile: błędy", "\n".join(e.errors) + "\n\nPopraw plik i spróbuj ponownie (wt profiles check).")
+            return None
+        return mod, cfg, origin
+
+    def list_box(self, title, entries, cur, footer, desc):
+        """Draw a centered list box. entries: list of parts lists; desc: text under the list."""
+        scr = self.scr
+        self.draw(refresh=False)
+        h, w = scr.getmaxyx()
+        bw = max(30, min(w - 4, 80))
+        inner = bw - 6
+        dlines = []
+        for para in (desc or "").splitlines():
+            dlines += textwrap.wrap(para, inner) or [""]
+        dlines = dlines[:4]
+        room = max(1, h - 9 - len(dlines))
+        top = max(0, min(cur - room + 1, len(entries) - room)) if len(entries) > room else 0
+        shown = entries[top:top + room]
+        bh = len(shown) + len(dlines) + 6
+        y0, x0 = max(0, (h - bh) // 2), max(0, (w - bw) // 2)
+        self.box(y0, x0, bh, bw, style="border", title=title, tstyle="accentb", clear=True)
+        for i, parts in enumerate(shown):
+            y = y0 + 2 + i
+            focused = top + i == cur
+            self.put(y, x0 + 2, ">" if focused else " ", self.c["accentb"])
+            self.segs(y, x0 + 4, parts, inner)
+        for i, line in enumerate(dlines):
+            self.put(y0 + 3 + len(shown) + i, x0 + 3, line, self.c["dim"], inner)
+        self.put(y0 + bh - 2, x0 + 3, footer, self.c["accentb"], inner)
+        scr.refresh()
+
+    def choose_mode(self, cfg, origin):
+        """Mode picker. Returns mode id, "" for "no actions", None on Esc."""
+        modes = sorted(cfg["modes"])
+        items = [(m, cfg["modes"][m]) for m in modes] + [("", {"label": "bez akcji", "description": "Sam worktree, żadnych akcji profilu."})]
+        cur = modes.index(cfg["defaultMode"]) if cfg["defaultMode"] in modes else len(items) - 1
+        while True:
+            entries = []
+            for mid, mode in items:
+                src = {"global": "globalne", "project": "projekt"}.get(origin.get(f"modes.{mid}"), "")
+                dflt = "  (domyślny)" if mid and mid == cfg["defaultMode"] else ""
+                entries.append([(mode.get("label", mid), "plain"), (dflt, "accent"), (f"  [{src}]" if src else "", "dim")])
+            mid, mode = items[cur]
+            desc = mode.get("description", "")
+            if mid:
+                desc += ("\n" if desc else "") + "akcje: " + (", ".join(cfg["actions"].get(a, {}).get("label", a)
+                                                                     for a in mode.get("actions", [])) or "brak")
+            self.list_box("Tryb nowego worktree", entries, cur, "[ j/k: wybór ]  [ Enter: dalej ]  [ Esc: anuluj ]", desc)
+            key = self.scr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                cur = (cur - 1) % len(items)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                cur = (cur + 1) % len(items)
+            elif key in (10, 13, curses.KEY_ENTER):
+                return mid
+            elif key in (27, ord("q")):
+                return None
+
+    def plan_form(self, cfg, mode):
+        """Checkboxes for the mode's actions and value pickers for variables. Returns (values, unchecked) or None."""
+        ids = cfg["modes"][mode].get("actions", [])
+        acts = cfg["actions"]
+        checked = {a: not acts[a].get("optional", False) for a in ids}
+        defaults = {v: d.get("default", d["choices"][0]) for v, d in cfg["variables"].items()}
+        values = dict(defaults)
+        rows = [("a", a) for a in ids] + [("v", v) for v in sorted(cfg["variables"])]
+        if not rows:
+            return values, [], defaults
+        session = next((a for a in ids if acts[a]["type"] == "tmux-session"), None)
+        cur = 0
+        while True:
+            off = set()  # actions that won't run: unchecked, or needing one that won't
+            for a in ids:
+                needs = list(acts[a].get("needs", [])) + ([session] if acts[a]["type"] == "tmux-window" and session else [])
+                if not checked[a] or any(n in off for n in needs):
+                    off.add(a)
+            entries = []
+            for kind, k in rows:
+                if kind == "a":
+                    box = "[x]" if checked[k] else "[ ]"
+                    note = "  (pominięta: wymaga odznaczonej akcji)" if checked[k] and k in off else ""
+                    entries.append([(box + " ", "green" if checked[k] else "dim"),
+                                    (acts[k].get("label", k), "plain" if k not in off else "dim"),
+                                    (f"  {acts[k]['type']}", "dim"), (note, "yellow")])
+                else:
+                    var = cfg["variables"][k]
+                    entries.append([("    " + var.get("label", k) + ": ", "plain"), ("< " + values[k] + " >", "accent")])
+            kind, k = rows[cur]
+            if kind == "a":
+                desc = acts[k].get("description", "")
+                if acts[k].get("needs"):
+                    desc += ("\n" if desc else "") + "wymaga: " + ", ".join(acts[k]["needs"])
+                foot = "[ Space: włącz/wyłącz ]  [ Enter: utwórz ]  [ Esc: wstecz ]"
+            else:
+                desc = cfg["variables"][k].get("description", "")
+                foot = "[ ←/→: zmień wartość ]  [ Enter: utwórz ]  [ Esc: wstecz ]"
+            self.list_box(f"Akcje: {cfg['modes'][mode].get('label', mode)}", entries, cur, foot, desc)
+            key = self.scr.getch()
+            if key in (curses.KEY_UP, ord("k")):
+                cur = (cur - 1) % len(rows)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                cur = (cur + 1) % len(rows)
+            elif key == ord(" ") and kind == "a":
+                checked[k] = not checked[k]
+            elif key in (curses.KEY_LEFT, curses.KEY_RIGHT, ord("h"), ord("l")) and kind == "v":
+                ch = cfg["variables"][k]["choices"]
+                step = 1 if key in (curses.KEY_RIGHT, ord("l")) else -1
+                values[k] = ch[(ch.index(values[k]) + step) % len(ch)]
+            elif key in (10, 13, curses.KEY_ENTER):
+                return values, [a for a in ids if not checked[a]], defaults
+            elif key in (27, ord("q")):
+                return None
+
+    def profile_args(self):
+        """Ask for mode/actions when the repo has profiles. Returns extra `wt new` args ([] = none), None = cancel."""
+        got = self.load_profiles()
+        if got is None:
+            return None
+        mod, cfg, origin = got
+        if cfg is None:
+            return []
+        while True:
+            mode = self.choose_mode(cfg, origin)
+            if mode is None:
+                return None
+            if mode == "":
+                return ["--no-profile"]
+            res = self.plan_form(cfg, mode)
+            if res is None:
+                continue  # back to the mode picker
+            values, unchecked, defaults = res
+            return new_args(mode, defaults, values, unchecked)
+
     def new(self):
         res = self.new_form()
         if not res or not res[0]:
             return
         name, target, title = res
-        self.message = f"tworzę {name}..."
-        self.draw()
+        extra = self.profile_args()
+        if extra is None:
+            self.message = "anulowano"
+            return
         cmd = [WT, "new", name]
         if target:
             cmd += ["--target", target]
         if title:
             cmd += ["--title", title]
+        cmd += extra
+        if extra and extra != ["--no-profile"]:
+            # Actions (npm ci, tmux...) print progress and can take long: run on the real terminal.
+            curses.def_prog_mode()
+            curses.endwin()
+            print(f"\n$ {display_cmd(cmd, WT)}\n", flush=True)
+            try:
+                rc = subprocess.call(cmd, cwd=self.main["path"] if self.main else None)
+            except OSError as e:
+                print(e)
+                rc = 1
+            input(f"\n[koniec, kod {rc}] Enter wraca do UI ")
+            curses.reset_prog_mode()
+            self.scr.refresh()
+            self.reload()
+            for i, r in enumerate(self.visible()):
+                if r["branch"] == name:
+                    self.cursor = i
+            created = any(r["branch"] == name for r in self.rows)
+            self.message = (f"+ {name}" if rc == 0 else
+                            f"! {name}: część akcji się nie powiodła (szczegóły w panelu)" if created else
+                            f"! wt new {name} nie powiodło się (kod {rc})")
+            return
+        self.message = f"tworzę {name}..."
+        self.draw()
         rc, out, err = run(cmd, timeout=120)
         self.reload()
         if rc == 0:
@@ -1964,6 +2297,10 @@ class App:
                     self.show_help = False
                     self.menu = "main"
                     self.open_pr_browser(target)
+                elif key == ord("t") and target:
+                    self.show_help = False
+                    self.menu = "main"
+                    self.open_tmux(target)
                 continue
             if key == ord("g") and not self.pending_g:
                 self.pending_g = True

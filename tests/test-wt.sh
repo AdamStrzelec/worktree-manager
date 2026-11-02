@@ -1170,6 +1170,99 @@ else
   echo "  (pomijam: brak tmux)"
 fi
 
+echo "-- profiles: UI"
+out=$(python3 - "$UIBIN" <<'PY' 2>&1
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("wt_ui", sys.argv[1])
+spec = importlib.util.spec_from_loader("wt_ui", loader)
+m = importlib.util.module_from_spec(spec); loader.exec_module(m)
+st = m.parse_actions("mode=f\naction.a.status=ok\naction.a.label=Zasady\ntmux_session=r/x\n"
+                     "action.b.status=failed\naction.b.code=3\naction.c.status=skipped\naction.c.reason=r\nśmieci\n")
+assert st["mode"] == "f" and st["session"] == "r/x", st
+assert [a["id"] for a in st["actions"]] == ["a", "b", "c"] and st["actions"][1]["code"] == "3", st
+assert st["actions"][0]["label"] == "Zasady" and st["actions"][2]["reason"] == "r"
+log = "=== a (shell) ===\nx\n=== a: kod 0 ===\n=== b (shell) ===\n1\n\n2\n3\n4\n=== b: kod 3 ===\n"
+assert m.log_tail(log, "b") == ["2", "3", "4"] and m.log_tail(log, "a") == ["x"] and m.log_tail(log, "z") == []
+assert m.new_args("f", {"model": "opus"}, {"model": "opus"}, []) == ["--mode", "f"]
+assert m.new_args("f", {"model": "opus", "k": "a"}, {"model": "sonnet", "k": "a"}, ["git"]) == \
+    ["--mode", "f", "--set", "model=sonnet", "--skip", "git"]
+row = {"path": "/p", "branch": "b"}
+assert m.open_menu_state(row, None, "ok", True)["t"][0] == "brak sesji"
+assert m.open_menu_state(row, None, "ok", True, "r/b", False)["t"][0] == "sesja zamknięta"
+assert m.open_menu_state(row, None, "ok", True, "r/b", True)["t"] is None
+assert m.load_profiles_module() is not None
+print("UI-PROFILES-OK")
+PY
+)
+contains "UI: parsery akcji" "$out" "UI-PROFILES-OK"
+PX=$(mktemp -d); mkdir -p "$PX/wt"
+printf '%s\n' '{"version":1,"defaultMode":"f","modes":{"f":{"actions":["s"]}},"actions":{"s":{"type":"shell","run":"touch ran"}}}' > "$PX/wt/profiles.json"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new np-a --no-fetch --no-profile 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "--no-profile exit 0" || bad "--no-profile exit $rc: $out"
+check_fail "--no-profile nie uruchamia akcji" test -e "$R/.claude/worktrees/np-a/ran"
+check_fail "--no-profile z --mode" env XDG_CONFIG_HOME="$PX" $WT new np-b --no-fetch --no-profile --mode f
+git -C "$R" worktree remove --force .claude/worktrees/np-a && git -C "$R" branch -q -D np-a
+rm -rf "$PX"
+
+echo "-- profiles: UI (pty)"
+PX=$(mktemp -d); mkdir -p "$PX/wt"
+printf '%s' '{"version":1,"defaultMode":"f","variables":{"greet":{"label":"Powitanie","choices":["hej","siema"]}},"modes":{"f":{"label":"Funkcja","description":"Funkcja z testem","actions":["rules","dep"]}},"actions":{"rules":{"type":"file","label":"Zasady","path":"R.md","content":"{greet}"},"dep":{"type":"shell","label":"Zależna","run":"touch dep-ran","needs":["rules"]}}}' > "$PX/wt/profiles.json"
+cat > "$PX/drive.py" <<'PY'
+import fcntl, os, pty, select, struct, sys, termios, time, re
+wt_bin, cwd = sys.argv[1:3]
+pid, fd = pty.fork()
+if pid == 0:
+    os.chdir(cwd); os.environ["TERM"] = "xterm-256color"; os.environ["WT_UI_POLL"] = "0"
+    os.execvp(os.environ.get("WT_SH", "bash"), [os.environ.get("WT_SH", "bash"), wt_bin, "ui"])
+fcntl.ioctl(fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+buf = b""
+def pump(sec):
+    global buf
+    end = time.time() + sec
+    while time.time() < end:
+        r, _, _ = select.select([fd], [], [], 0.1)
+        if r:
+            try: d = os.read(fd, 65536)
+            except OSError: return
+            if not d: return
+            buf += d
+def send(s): os.write(fd, s.encode())
+def until(txt, to=8):
+    end = time.time() + to
+    while time.time() < end:
+        pump(0.2)
+        if txt.encode() in buf: return True
+    return False
+def mark(name, ok): print(("OK " if ok else "FAIL ") + name)
+pump(2)
+send("n"); pump(0.8)
+send("ui-a"); pump(0.3)
+send("\r"); pump(0.3); send("\r"); pump(0.8)
+mark("picker trybu", until("Tryb nowego worktree"))
+mark("opis trybu", until("Funkcja z testem"))
+send("\r"); pump(0.8)
+mark("formularz akcji", until("Akcje: Funkcja"))
+mark("zmienna", until("< hej >"))
+send(" "); pump(0.3)       # uncheck first action (Zasady)
+mark("zależna oznaczona", until("pominięta: wymaga odznaczonej"))
+send("j"); send("j"); pump(0.3); send("l"); pump(0.3)  # variable -> siema
+buf = b""
+send("\r")
+mark("wt new uruchomione", until("--set greet=siema", 10))
+mark("koniec", until("[koniec, kod 0]", 15))
+buf = b""
+send("\r")
+mark("panel akcji profilu", until("Akcje profilu", 6))
+send("q"); pump(1)
+PY
+UT=$(mkrepo)
+out=$(WT_SH="$SH" XDG_CONFIG_HOME="$PX" python3 "$PX/drive.py" "$WT_BIN" "$UT" 2>&1)
+for w in "picker trybu" "opis trybu" "formularz akcji" "zmienna" "zależna oznaczona" "wt new uruchomione" "koniec" "panel akcji profilu"; do
+  contains "UI pty: $w" "$out" "OK $w"
+done
+contains "UI pty: --skip z odznaczenia" "$(cat "$UT/.claude/worktrees/ui-a/.wt-actions" 2>/dev/null)" "action.rules.reason=pominięta (--skip)"
+rm -rf "$PX" "$UT"
+
 echo
 echo "WYNIK: $PASS ok, $FAIL fail"
 [ "$FAIL" -eq 0 ]

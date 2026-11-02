@@ -161,6 +161,8 @@ Drop nie potrzebuje Pythona ani pliku profili; wystarczy `.wt-actions`. Brak pli
 
 - `n` (nowy worktree): po nazwie ekran **Tryb** – lista trybów (`label`, pod spodem `description`, znacznik źródła). Gdy pliku brak, ekran pomijany.
 - Następnie ekran **Akcje** dla wybranego trybu: checkbox per akcja (`label`, `description` z podstawionymi wartościami), lista zmiennych z wartością, `←/→` zmienia wartość w `choices`. Enter tworzy worktree z odpowiednimi `--set`/`--skip`.
+- Wybór „bez akcji” daje `wt new --no-profile` (profil w ogóle nie jest czytany). Z akcjami `wt new` działa na prawdziwym terminalu (curses wstrzymane, widać wyjście `npm ci` itd.), potem Enter wraca do UI.
+- Szczegóły worktree: sekcja „Akcje profilu” (ok / ✗ z kodem i 3 ostatnimi liniami z logu / pominięte z powodem, nazwa sesji tmux); na liście notka „błąd akcji profilu”.
 - `P` (nowy ekran **Profile**): podgląd scalonej konfiguracji; edycja `defaultMode`, domyślnych wartości zmiennych i listy akcji w trybie. Zapis tylko do `.git/wt-profiles.json`, jako minimalne nadpisanie (tylko zmienione klucze). Błędy walidacji pokazane przy pozycji.
 - `o` → `t`: przełączenie na sesję tmux worktree (z `.wt-actions`), dziś wyłączone.
 - Edycja `run`/`content` w UI: poza v1 (to edytuje się w pliku; UI pokazuje ścieżkę pliku).
