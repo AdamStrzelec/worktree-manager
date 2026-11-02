@@ -337,8 +337,9 @@ def resolve(cfg, ctx, mode=None, sets=(), skips=(), types=None):
     if types is not None:
         for aid in ids:
             if aid not in skips and cfg["actions"][aid]["type"] not in types:
-                errors.append("akcja \"%s\": typ \"%s\" nie jest jeszcze obsługiwany przez wt"
-                              % (aid, cfg["actions"][aid]["type"]))
+                atype = cfg["actions"][aid]["type"]
+                hint = "brak tmux w PATH" if atype.startswith("tmux") else "nieobsługiwany przez tę wersję wt"
+                errors.append("akcja \"%s\": typ \"%s\" niedostępny (%s)" % (aid, atype, hint))
     for s in skips:
         if s not in ids:
             errors.append("--skip %s: brak takiej akcji w trybie \"%s\"" % (s, mode))

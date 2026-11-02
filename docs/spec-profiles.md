@@ -144,17 +144,18 @@ tmux_window=claude
 tmux_sendkeys.claude=/exit
 ```
 
-Kolejność w `wt drop` (bez `--check`):
+Kolejność w `wt drop`:
 
-1. Istniejące sprawdzenia (czyste drzewo, zmergowana gałąź).
-2. `beforeDrop.sendKeys` dla każdego okna, potem odczekanie do 3 s, aż proces w oknie się skończy.
-3. `tmux kill-session` (jeśli `drop` działa wewnątrz tej sesji: najpierw `switch-client -l`, a gdy nie ma poprzedniej sesji, kill przez `run-shell -b` po zakończeniu `wt`).
-4. Istniejące sprawdzenie żywych procesów / `stop_procs` – teraz już bez claude z tmux.
-5. `WT_PRE_DROP`, `git worktree remove`, `WT_POST_DROP`, usunięcie gałęzi (bez zmian).
+1. Lista procesów w worktree (`lsof`), potem drzewo procesów sesji tmux worktree (panele + potomkowie). Procesy sesji nie blokują dropu; inne (i żywe) blokują jak dotąd.
+2. Jeśli `wt` sam jest potomkiem tej sesji: odmowa („uruchom drop z innej sesji”), bo zamknięcie sesji zabiłoby drop w połowie.
+3. Istniejące sprawdzenia (czyste drzewo, zajętość, zmergowanie). `--check` kończy tu i zapowiada zamknięcie sesji.
+4. `stop_procs` dla obcych procesów (tylko z `--stop-procs`).
+5. `beforeDrop.sendKeys` do każdego okna, 1 s przerwy, `tmux kill-session`, do 3 s czekania na procesy sesji, potem `kill` pozostałych.
+6. `WT_PRE_DROP`, `git worktree remove`, `WT_POST_DROP`, usunięcie gałęzi (bez zmian). Jeśli program z sesji zostawił pliki, `git worktree remove` odmówi (sesja jest już zamknięta, worktree zostaje).
+
+Sesja tmux: `new-session -d -n shell -c <worktree>` (pierwsze okno to zwykła powłoka), okna `new-window -d` z `run` wpisanym przez `send-keys`. `.wt-actions` trzyma `tmux_session=`, `action.<id>.window=@<id okna>` i `action.<id>.sendkeys=`. `WT_TMUX_SOCKET` (tylko testy) kieruje wszystkie wywołania na osobny serwer `tmux -L`.
 
 Drop nie potrzebuje Pythona ani pliku profili; wystarczy `.wt-actions`. Brak pliku = brak sprzątania (worktree sprzed tej funkcji). Sesja już nie istnieje = cisza.
-
-Do sprawdzenia przy implementacji: czy krok 4 (wykrywanie procesów) obecnie stoi przed punktem, w którym można zamknąć tmux; jeśli tak, przestawić tak, żeby zamknięcie sesji było przed nim.
 
 ## 6. UI (`wt ui`)
 
@@ -182,8 +183,8 @@ Do sprawdzenia przy implementacji: czy krok 4 (wykrywanie procesów) obecnie sto
 
 1. `--resolve` + scalanie + walidacja + `wt profiles [check]`; testy Pythona.
 2. `wt new --mode` z akcjami `file` i `shell`; `.wt-actions`; testy bash.
-3. `tmux-session` / `tmux-window` + sprzątanie w `drop`; testy na osobnym serwerze tmux.
-4. `beforeDrop.sendKeys` + obsługa drop z wnętrza sesji.
+3. `tmux-session` / `tmux-window` + sprzątanie w `drop`, `beforeDrop.sendKeys`, odmowa dropu z wnętrza sesji; testy na osobnym serwerze tmux.
+4. (scalone z 3)
 5. UI: ekrany Tryb i Akcje w `n`; `o` → `t`.
 6. UI: ekran Profile z zapisem do `.git/`.
 7. Docs (`docs/wt-manager.md`, README), przykładowy `profiles.json`.

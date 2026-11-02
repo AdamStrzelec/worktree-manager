@@ -1089,7 +1089,9 @@ contains "--skip pomija akcję" "$out" "Zależności: pominięta (--skip)"
 contains "--skip pomija zależne" "$out" "dev: pominięta (wymaga deps)"
 check_fail "nieznany tryb" env XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --mode zzz
 check_fail "zła wartość --set" env XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --set greet=zzz
-check_fail "tmux jeszcze nieobsługiwany" env XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --mode tm
+out=$(cd "$R" && PATH=/usr/bin:/bin XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --mode tm 2>&1); rc=$?
+[ "$rc" -ne 0 ] && ok "akcje tmux bez tmux: błąd" || bad "akcje tmux bez tmux przeszły"
+contains "akcje tmux bez tmux: komunikat" "$out" "brak tmux w PATH"
 check_fail "bez worktree po błędzie profilu" test -e "$R/.claude/worktrees/prof-d"
 check_fail "bez gałęzi po błędzie profilu" git -C "$R" rev-parse --verify --quiet refs/heads/prof-d
 check_fail "--mode bez pliku profili" env XDG_CONFIG_HOME="$PX/nic" $WT new prof-e --no-fetch --mode f
@@ -1098,6 +1100,75 @@ out=$(cd "$R" && XDG_CONFIG_HOME="$PX/nic" $WT new prof-e --no-fetch 2>&1); rc=$
 check_fail "bez profili brak .wt-actions" test -e "$R/.claude/worktrees/prof-e/.wt-actions"
 for w in prof-a prof-b prof-c prof-e; do git -C "$R" worktree remove --force ".claude/worktrees/$w" && git -C "$R" branch -q -D "$w"; done
 rm -rf "$PX"
+
+echo "-- profiles: tmux"
+if command -v tmux >/dev/null 2>&1; then
+  export WT_TMUX_SOCKET="wt-test-$$"
+  TM() { tmux -L "$WT_TMUX_SOCKET" "$@"; }
+  PX=$(mktemp -d); mkdir -p "$PX/wt"
+  cat > "$PX/wt/profiles.json" <<'JSON'
+{"version": 1, "defaultMode": "t",
+ "modes": {"t": {"actions": ["sess", "cl", "bad", "after"]}},
+ "actions": {
+   "sess": {"type": "tmux-session"},
+   "cl": {"type": "tmux-window", "window": "claude", "run": "sh -c 'read x; echo \"$x\" > ../typed-{name}'",
+          "beforeDrop": {"sendKeys": "koniec"}},
+   "bad": {"type": "shell", "run": "exit 4"},
+   "after": {"type": "tmux-window", "window": "git", "run": "sleep 300"}}}
+JSON
+  RN=$(basename "$R" | tr '.:' '--')
+  out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new tm-a --no-fetch 2>&1); rc=$?
+  PT="$R/.claude/worktrees/tm-a"
+  [ "$rc" -eq 4 ] && ok "tmux: kod nieudanej akcji shell" || bad "tmux new exit $rc: $out"
+  check "tmux: sesja istnieje" TM has-session -t "=$RN/tm-a"
+  wins=$(TM list-windows -t "=$RN/tm-a" -F '#{window_name}' 2>&1 | tr '\n' ' ')
+  contains "tmux: okna shell, claude, git" "$wins" "shell claude git"
+  pp=$(TM list-panes -t "=$RN/tm-a:shell" -F '#{pane_current_path}' 2>/dev/null)
+  [ "$(cd "$pp" 2>/dev/null && pwd -P)" = "$PT" ] && ok "tmux: katalog okna = worktree" || bad "tmux: katalog $pp"
+  contains "tmux: komunikat attach" "$out" "tmux attach -t '$RN/tm-a'"
+  contains ".wt-actions sesja" "$(cat "$PT/.wt-actions")" "tmux_session=$RN/tm-a"
+  contains ".wt-actions sendkeys" "$(cat "$PT/.wt-actions")" "action.cl.sendkeys=koniec"
+  out=$(cd "$R" && $WT drop tm-a --check 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop --check nie blokuje się na procesach sesji" || bad "drop --check exit $rc: $out"
+  contains "tmux: --check zapowiada zamknięcie" "$out" "sesja tmux do zamknięcia"
+  check "tmux: --check nie zamyka sesji" TM has-session -t "=$RN/tm-a"
+  sleep 1
+  out=$(cd "$R" && $WT drop tm-a 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop exit 0" || bad "tmux drop exit $rc: $out"
+  check_fail "tmux: sesja zamknięta" TM has-session -t "=$RN/tm-a"
+  check_fail "tmux: worktree usunięty" test -d "$PT"
+  contains "tmux: sendKeys wysłane" "$out" "wysyłam do okna"
+  [ "$(cat "$R/.claude/worktrees/typed-tm-a" 2>/dev/null)" = "koniec" ] && ok "tmux: program odebrał sendKeys" || bad "sendKeys nie dotarło"
+  # Session already gone: drop must still work quietly.
+  out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new tm-b --no-fetch --skip bad 2>&1)
+  TM kill-session -t "=$RN/tm-b" 2>/dev/null
+  out=$(cd "$R" && $WT drop tm-b 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop bez żywej sesji" || bad "drop bez sesji exit $rc: $out"
+  # A process outside the session still blocks the drop.
+  out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new tm-c --no-fetch --skip bad 2>&1)
+  (cd "$R/.claude/worktrees/tm-c" && exec sleep 30) & SP=$!
+  sleep 0.5
+  out=$(cd "$R" && $WT drop tm-c 2>&1); rc=$?
+  [ "$rc" -ne 0 ] && ok "tmux: obcy proces blokuje drop" || bad "obcy proces nie zablokował"
+  check "tmux: sesja nietknięta po odmowie" TM has-session -t "=$RN/tm-c"
+  kill "$SP" 2>/dev/null; wait "$SP" 2>/dev/null
+  out=$(cd "$R" && $WT drop tm-c 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop po zakończeniu obcego procesu" || bad "drop tm-c exit $rc: $out"
+  # drop run from inside the worktree's own session is refused (it would kill itself).
+  out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new tm-d --no-fetch --skip bad 2>&1)
+  TM send-keys -t "=$RN/tm-d:shell" "cd '$R' && $WT drop tm-d > '$PX/in-sess.out' 2>&1; echo \$? > '$PX/in-sess.rc'" Enter
+  for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do [ -f "$PX/in-sess.rc" ] && break; sleep 0.3; done
+  [ "$(cat "$PX/in-sess.rc" 2>/dev/null)" = 1 ] && ok "tmux: drop z wnętrza sesji odmawia" || bad "drop z wnętrza: rc=$(cat "$PX/in-sess.rc" 2>&1)"
+  contains "tmux: komunikat w sesji" "$(cat "$PX/in-sess.out" 2>/dev/null)" "jesteś w sesji tmux"
+  check "tmux: sesja przeżyła odmowę" TM has-session -t "=$RN/tm-d"
+  out=$(cd "$R" && $WT drop tm-d 2>&1); rc=$?
+  [ "$rc" -eq 0 ] && ok "tmux: drop z zewnątrz po odmowie" || bad "drop tm-d exit $rc: $out"
+  TM kill-server 2>/dev/null
+  unset WT_TMUX_SOCKET
+  rm -rf "$PX"
+else
+  echo "  (pomijam: brak tmux)"
+fi
 
 echo
 echo "WYNIK: $PASS ok, $FAIL fail"
