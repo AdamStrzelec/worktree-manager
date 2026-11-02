@@ -309,10 +309,11 @@ def var_defaults(cfg):
     return {vid: var.get("default", var["choices"][0]) for vid, var in cfg["variables"].items()}
 
 
-def resolve(cfg, ctx, mode=None, sets=(), skips=()):
+def resolve(cfg, ctx, mode=None, sets=(), skips=(), types=None):
     """Turn a mode into a plan: list of (kind, id, fields) with kind "action" or "skip".
 
     ctx: dict with name, branch, path, base, repo. sets: ["var=value"]. skips: [action id].
+    types: action types the caller can run (None = all); others are an error.
     Raises ProfileError on bad arguments.
     """
     errors = []
@@ -333,6 +334,11 @@ def resolve(cfg, ctx, mode=None, sets=(), skips=()):
             errors.append("--set %s: wartość spoza %s" % (item, var["choices"]))
         else:
             values[key] = val
+    if types is not None:
+        for aid in ids:
+            if aid not in skips and cfg["actions"][aid]["type"] not in types:
+                errors.append("akcja \"%s\": typ \"%s\" nie jest jeszcze obsługiwany przez wt"
+                              % (aid, cfg["actions"][aid]["type"]))
     for s in skips:
         if s not in ids:
             errors.append("--skip %s: brak takiej akcji w trybie \"%s\"" % (s, mode))
@@ -359,7 +365,8 @@ def resolve(cfg, ctx, mode=None, sets=(), skips=()):
             if missing:
                 dropped[aid] = "pominięta (wymaga %s)" % ", ".join(missing)
         if aid in dropped:
-            plan.append(("skip", aid, [("reason", dropped[aid])]))
+            plan.append(("skip", aid, [("label", substitute(action.get("label", aid), values, False)),
+                                       ("reason", dropped[aid])]))
             continue
         fields = [("type", action["type"]), ("label", substitute(action.get("label", aid), values, False)),
                   ("needs", " ".join(needs))]
@@ -421,7 +428,7 @@ def parse_args(argv):
     if not argv:
         raise SystemExit(__doc__)
     cmd, rest = argv[0], argv[1:]
-    single = {"--global", "--project", "--name", "--path", "--branch", "--base", "--repo", "--mode"}
+    single = {"--global", "--project", "--name", "--path", "--branch", "--base", "--repo", "--mode", "--types"}
     multi = {"--set", "--skip"}
     opts = {k: None for k in single}
     opts.update({k: [] for k in multi})
@@ -456,6 +463,9 @@ def main(argv):
     if cmd == "list":
         print(describe(cfg, origin, paths) if cfg else "brak plików profili")
         return 0
+    if cmd == "default-mode":
+        print((cfg or {}).get("defaultMode") or "")
+        return 0
     if cmd == "resolve":
         if cfg is None:
             if opts["--mode"]:
@@ -469,7 +479,8 @@ def main(argv):
                 return 2
             ctx[k] = opts["--" + k]
         try:
-            sys.stdout.write(encode_plan(resolve(cfg, ctx, opts["--mode"], opts["--set"], opts["--skip"])))
+            sys.stdout.write(encode_plan(resolve(cfg, ctx, opts["--mode"], opts["--set"], opts["--skip"],
+                                              opts["--types"].split() if opts["--types"] else None)))
         except ProfileError as e:
             for err in e.errors:
                 print("błąd: " + err, file=sys.stderr)

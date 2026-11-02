@@ -97,7 +97,7 @@ Oba pliki są zaufanym źródłem (nie są commitowane), więc mogą zawierać k
 
 - Pole `needs` (lista id akcji, które stoją wcześniej na liście trybu; to wyklucza cykle): akcja startuje tylko, gdy wszystkie z `needs` mają status `ok`; inaczej status `skipped`. `tmux-window` ma domyślną zależność od `tmux-session` trybu.
 - Akcje bez zależności od nieudanej akcji wykonują się normalnie. Worktree nigdy nie jest usuwany ani cofany z powodu błędu akcji.
-- Statusy: `ok`, `failed` (kod wyjścia), `skipped` (powód: której zależności brak). Zapisywane do `.wt-actions` po każdej akcji, z ostatnimi 20 liniami stderr; pełny log w `<worktree>/.wt-actions.log` (oba w `info/exclude`).
+- Statusy: `ok`, `failed` (kod wyjścia), `skipped` (powód: której zależności brak). Zapisywane do `.wt-actions` po każdej akcji (`action.<id>.status|label|code|reason`); pełne wyjście akcji w `<worktree>/.wt-actions.log`, sekcjami `=== <id> ===` (oba w `info/exclude`). UI bierze końcówkę błędu z logu. Akcje `shell` dostają env `WT_NAME`, `WT_PATH`, `WT_BRANCH`, `WT_MAIN`, `WT_MODE`; ich wyjście idzie też na terminal.
 - Terminal: podsumowanie na końcu `wt new` (✓/✗/–), kod wyjścia != 0, gdy jakakolwiek akcja ma `failed`.
 - UI: w szczegółach worktree sekcja „Akcje” ze statusami i końcówką błędu; znacznik `!` na liście.
 - Cykl w `needs` lub odwołanie do akcji spoza trybu = błąd walidacji (przed utworzeniem worktree), podobnie JSON, zmienne, brak `tmux`/`python3`.

@@ -981,7 +981,7 @@ assert byid["tmux"][1]["session"] == "my-repo/feat/x y" and byid["tmux"][1]["att
 plan = m.resolve(cfg, ctx, "feature", [], ["deps", "tmux"])
 kinds = {a: k for k, a, _ in plan}
 assert kinds == {"rules": "action", "deps": "skip", "dev": "skip", "tmux": "skip", "claude": "skip", "git": "skip"}, kinds
-assert dict(plan[2][2])["reason"] == "pominięta (wymaga deps)"
+assert dict(plan[2][2])["reason"] == "pominięta (wymaga deps)" and dict(plan[2][2])["label"] == "dev"
 assert m.resolve(cfg, ctx, "bare") == []
 for args in (("nie-ma", [], []), ("feature", ["model=gpt"], []), ("feature", ["x=1"], []), ("feature", [], ["zzz"])):
     try:
@@ -1044,6 +1044,60 @@ out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles check 2>&1); rc=$?
 contains "profiles check komunikat" "$out" "actions.s [projekt]"
 rm -f "$R/.git/wt-profiles.json"; rm -rf "$PX"
 check_fail "profiles zła podkomenda" $WT profiles bogus
+
+echo "-- profiles: wt new z akcjami"
+PX=$(mktemp -d); mkdir -p "$PX/wt"
+cat > "$PX/wt/profiles.json" <<'JSON'
+{"version": 1, "defaultMode": "f",
+ "variables": {"greet": {"choices": ["hej", "siema"]}},
+ "modes": {
+   "f": {"actions": ["rules", "deps", "dev", "solo"]},
+   "ok": {"actions": ["rules"]},
+   "tm": {"actions": ["t"]}},
+ "actions": {
+   "rules": {"type": "file", "label": "Zasady", "path": "notes/RULES.md", "content": "{greet} {branch}\n"},
+   "deps": {"type": "shell", "label": "Zależności", "run": "echo instaluje; echo zle >&2; exit 3"},
+   "dev": {"type": "shell", "run": "touch dev-ran", "needs": ["deps"]},
+   "solo": {"type": "shell", "run": "printf '%s|%s' \"$WT_NAME\" \"$WT_MODE\" > solo-ran"},
+   "t": {"type": "tmux-session"}}}
+JSON
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new prof-a --no-fetch 2>&1); rc=$?
+P1="$R/.claude/worktrees/prof-a"
+[ "$rc" -eq 3 ] && ok "new z błędną akcją zwraca jej kod" || bad "new exit $rc: $out"
+check "worktree zostaje mimo błędu" test -d "$P1"
+[ "$(cat "$P1/notes/RULES.md" 2>/dev/null)" = "hej prof-a" ] && ok "akcja file z placeholderami" || bad "RULES.md: $(cat "$P1/notes/RULES.md" 2>&1)"
+check_fail "zależna akcja pominięta" test -e "$P1/dev-ran"
+[ "$(cat "$P1/solo-ran" 2>/dev/null)" = "prof-a|f" ] && ok "niezależna akcja wykonana z env" || bad "solo-ran: $(cat "$P1/solo-ran" 2>&1)"
+contains "podsumowanie błąd" "$out" "BŁĄD Zależności (kod 3)"
+contains "podsumowanie pominięta" "$out" "dev: pominięta (nie powiodło się: deps)"
+contains "output akcji w terminalu" "$out" "instaluje"
+st=$(cat "$P1/.wt-actions" 2>/dev/null)
+contains ".wt-actions tryb" "$st" "mode=f"
+contains ".wt-actions ok" "$st" "action.rules.status=ok"
+contains ".wt-actions failed" "$st" "action.deps.status=failed"
+contains ".wt-actions kod" "$st" "action.deps.code=3"
+contains ".wt-actions skipped" "$st" "action.dev.status=skipped"
+contains "log stderr" "$(cat "$P1/.wt-actions.log" 2>/dev/null)" "zle"
+[ -z "$(git -C "$P1" status --porcelain --ignored=no)" ] || [ "$(git -C "$P1" status --porcelain | grep -v -e dev-ran -e solo-ran)" = "" ] \
+  && ok "pliki akcji wykluczone z gita" || bad "status: $(git -C "$P1" status --porcelain)"
+rm -f "$P1/solo-ran"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new prof-b --no-fetch --mode ok --set greet=siema 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "new --mode --set exit 0" || bad "new --mode exit $rc: $out"
+[ "$(cat "$R/.claude/worktrees/prof-b/notes/RULES.md" 2>/dev/null)" = "siema prof-b" ] && ok "--set podstawia zmienną" || bad "--set"
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT new prof-c --no-fetch --skip deps 2>&1)
+contains "--skip pomija akcję" "$out" "Zależności: pominięta (--skip)"
+contains "--skip pomija zależne" "$out" "dev: pominięta (wymaga deps)"
+check_fail "nieznany tryb" env XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --mode zzz
+check_fail "zła wartość --set" env XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --set greet=zzz
+check_fail "tmux jeszcze nieobsługiwany" env XDG_CONFIG_HOME="$PX" $WT new prof-d --no-fetch --mode tm
+check_fail "bez worktree po błędzie profilu" test -e "$R/.claude/worktrees/prof-d"
+check_fail "bez gałęzi po błędzie profilu" git -C "$R" rev-parse --verify --quiet refs/heads/prof-d
+check_fail "--mode bez pliku profili" env XDG_CONFIG_HOME="$PX/nic" $WT new prof-e --no-fetch --mode f
+out=$(cd "$R" && XDG_CONFIG_HOME="$PX/nic" $WT new prof-e --no-fetch 2>&1); rc=$?
+[ "$rc" -eq 0 ] && ok "new bez profili jak dawniej" || bad "new bez profili exit $rc: $out"
+check_fail "bez profili brak .wt-actions" test -e "$R/.claude/worktrees/prof-e/.wt-actions"
+for w in prof-a prof-b prof-c prof-e; do git -C "$R" worktree remove --force ".claude/worktrees/$w" && git -C "$R" branch -q -D "$w"; done
+rm -rf "$PX"
 
 echo
 echo "WYNIK: $PASS ok, $FAIL fail"

@@ -241,6 +241,7 @@ usage() {
   {
     printf 'Użycie: wt <komenda> [argumenty]\n\n'
     printf '  new <temat> [--no-fetch] nowy worktree i gałąź od (zaktualizowanej) bazy\n'
+    printf '      [--mode <tryb>] [--set zmienna=wartość] [--skip <akcja>]  akcje z profili\n'
     printf '  list | ls               tabela worktree\n'
     printf '  status                  kolizje plików między worktree\n'
     printf '  test [args]             testy w bieżącym worktree\n'
@@ -605,10 +606,14 @@ sync_base() {
 
 cmd_new() {
   local name="" path f post_rc=0 rel hash do_fetch=1 target="" title=""
-  local usage="użycie: wt new <temat> [--target <gałąź>] [--title <tytuł>] [--no-fetch]"
+  local mode="" sets="" skips="" plan plan_rc=0 nl=$'\n'
+  local usage="użycie: wt new <temat> [--target <gałąź>] [--title <tytuł>] [--no-fetch] [--mode <tryb>] [--set zmienna=wartość]... [--skip <akcja>]..."
   while [ $# -gt 0 ]; do
     case "$1" in
       --no-fetch) do_fetch=0 ;;
+      --mode)     [ $# -ge 2 ] || die "$usage"; mode=$2; shift ;;
+      --set)      [ $# -ge 2 ] || die "$usage"; sets="$sets$2$nl"; shift ;;
+      --skip)     [ $# -ge 2 ] || die "$usage"; skips="$skips$2$nl"; shift ;;
       --target)   [ $# -ge 2 ] || die "$usage"; target=$2; shift ;;
       --title)    [ $# -ge 2 ] || die "$usage"; title=$2; shift ;;
       -*)         die "nieznana opcja: $1" ;;
@@ -638,6 +643,15 @@ cmd_new() {
 
   if [ "$do_fetch" = 1 ] && [ "$CFG_WT_FETCH" != 0 ]; then
     sync_base
+  fi
+
+  # Resolve profiles before creating anything: a bad profile or argument leaves no trace.
+  plan=$(mktemp "${TMPDIR:-/tmp}/wt-plan.XXXXXX") || die "mktemp nie powiodło się"
+  # shellcheck disable=SC2064
+  trap "rm -f '$plan'" EXIT
+  profiles_resolve "$plan" "$name" "$path" "$mode" "$sets" "$skips"
+  if [ -s "$plan" ] && [ -z "$mode" ]; then
+    mode=$(profiles_helper default-mode) || die "profile: nie udało się odczytać domyślnego trybu"
   fi
 
   git -C "$MAIN" worktree add -q -b "$name" "$path" "$BASE" || die "git worktree add nie powiodło się"
@@ -679,6 +693,8 @@ cmd_new() {
     "$MAIN"/*) rel=${WT_ROOT#"$MAIN"}; add_exclude "$rel/" ;;
   esac
 
+  run_plan "$path" "$name" "$plan" "$mode" || plan_rc=$?
+
   if [ -n "$CFG_WT_POST_NEW" ]; then
     info "uruchamiam WT_POST_NEW: $CFG_WT_POST_NEW"
     (cd "$path" && bash -c "$CFG_WT_POST_NEW") || post_rc=$?
@@ -688,6 +704,7 @@ cmd_new() {
   hash=$(git -C "$MAIN" rev-parse --short "$BASE")
   info "gałąź: $name (od $BASE @ $hash)"
   info "cd $path"
+  [ "$plan_rc" -ne 0 ] && return "$plan_rc"
   return "$post_rc"
 }
 
@@ -1054,6 +1071,128 @@ WTEOF
   git -C "$MAIN" config --unset "branch.$name.wt-target" 2>/dev/null
   git -C "$MAIN" config --unset "branch.$name.wt-title" 2>/dev/null
   info "usunięto worktree i gałąź: $name"
+}
+
+# ---------------------------------------------------------- profile actions --
+
+# profiles_resolve PLANFILE NAME PATH MODE SETS SKIPS - write the NUL plan for `wt new`.
+# SETS/SKIPS are newline-separated lists. Returns 0 with an empty plan when no profiles exist.
+profiles_resolve() {
+  local plan=$1 name=$2 path=$3 mode=$4 sets=$5 skips=$6 item
+  set --
+  [ -n "$mode" ] && set -- "$@" --mode "$mode"
+  while IFS= read -r item; do [ -n "$item" ] && set -- "$@" --set "$item"; done <<EOF_SETS
+$sets
+EOF_SETS
+  while IFS= read -r item; do [ -n "$item" ] && set -- "$@" --skip "$item"; done <<EOF_SKIPS
+$skips
+EOF_SKIPS
+  if [ ! -f "$(profiles_global)" ] && [ ! -f "$(profiles_project)" ]; then
+    [ $# -eq 0 ] || die "--mode/--set/--skip wymagają pliku profili ($(profiles_global) lub $(profiles_project))"
+    : > "$plan"
+    return 0
+  fi
+  profiles_helper resolve --name "$name" --branch "$name" --path "$path" --base "$BASE" \
+    --repo "$(basename "$MAIN")" --types "file shell" "$@" > "$plan" || die "profile: błąd, worktree nie został utworzony"
+}
+
+# record_action PATH ID STATUS [KEY VALUE]... - append status lines to <worktree>/.wt-actions.
+record_action() {
+  local path=$1 id=$2 status=$3
+  shift 3
+  printf 'action.%s.status=%s\n' "$id" "$status" >> "$path/.wt-actions"
+  while [ $# -ge 2 ]; do
+    printf 'action.%s.%s=%s\n' "$id" "$1" "$(printf '%s' "$2" | tr '\n\r\t' '   ')" >> "$path/.wt-actions"
+    shift 2
+  done
+}
+
+# run_file_action PATH REL CONTENT - create REL inside the worktree (never overwrite, never escape).
+run_file_action() {
+  local path=$1 rel=$2 content=$3 dir real
+  if [ -e "$path/$rel" ] || [ -L "$path/$rel" ]; then
+    info "    plik $rel już istnieje, nie nadpisuję"
+    return 0
+  fi
+  dir=$(dirname "$path/$rel")
+  mkdir -p "$dir" || return 1
+  real=$(cd "$dir" && pwd -P) || return 1
+  case "$real/" in
+    "$(cd "$path" && pwd -P)"/*) ;;
+    *) printf 'wt: %s wychodzi poza worktree (symlink)\n' "$rel" >&2; return 1 ;;
+  esac
+  printf '%s' "$content" > "$path/$rel" || return 1
+  add_exclude "/$rel"
+}
+
+# run_plan PATH NAME PLANFILE MODE - run profile actions; independent actions continue after a failure.
+# Prints a summary; returns the exit code of the first failed action (0 when none failed).
+run_plan() {
+  local path=$1 name=$2 plan=$3 mode=$4 f key kind="" id="" rc=0 arc ok_ids=" " summary="" n missing
+  local a_type a_label a_needs a_path a_content a_run reason log="$path/.wt-actions.log"
+  [ -s "$plan" ] || return 0
+  printf 'mode=%s\n' "$mode" > "$path/.wt-actions"
+  : > "$log"
+  add_exclude ".wt-actions"
+  add_exclude ".wt-actions.log"
+  info "akcje profilu:"
+  while IFS= read -r -d '' f; do
+    if [ -z "$kind" ]; then
+      kind=$f; id=""; key=""; a_type=""; a_label=""; a_needs=""; a_path=""; a_content=""; a_run=""; reason=""
+      continue
+    fi
+    if [ -z "$id" ]; then id=$f; continue; fi
+    if [ -z "$key" ]; then
+      if [ -n "$f" ]; then key=$f; continue; fi
+      # End of record: run it.
+      [ -z "$a_label" ] && a_label=$id
+      if [ "$kind" = skip ]; then
+        record_action "$path" "$id" skipped label "$a_label" reason "$reason"
+        summary="$summary  -    $a_label: $reason"$'\n'
+        kind=""; continue
+      fi
+      missing=""
+      for n in $a_needs; do
+        case "$ok_ids" in *" $n "*) ;; *) missing="$missing $n" ;; esac
+      done
+      if [ -n "$missing" ]; then
+        reason="pominięta (nie powiodło się:$missing)"
+        record_action "$path" "$id" skipped label "$a_label" reason "$reason"
+        summary="$summary  -    $a_label: $reason"$'\n'
+        kind=""; continue
+      fi
+      info "  > $a_label"
+      printf '=== %s (%s) ===\n' "$id" "$a_type" >> "$log"
+      arc=0
+      case "$a_type" in
+        file)  run_file_action "$path" "$a_path" "$a_content" 2>> "$log" || arc=$? ;;
+        shell)
+          (cd "$path" && WT_NAME=$name WT_PATH=$path WT_BRANCH=$name WT_MAIN=$MAIN WT_MODE=$mode \
+            bash -c "$a_run") 2>&1 | tee -a "$log"
+          arc=${PIPESTATUS[0]} ;;
+      esac
+      printf '=== %s: kod %s ===\n' "$id" "$arc" >> "$log"
+      if [ "$arc" -eq 0 ]; then
+        ok_ids="$ok_ids$id "
+        record_action "$path" "$id" ok label "$a_label"
+        summary="$summary  ok   $a_label"$'\n'
+      else
+        [ "$rc" -eq 0 ] && rc=$arc
+        record_action "$path" "$id" failed label "$a_label" code "$arc"
+        summary="$summary  BŁĄD $a_label (kod $arc)"$'\n'
+      fi
+      kind=""; continue
+    fi
+    case "$key" in
+      type) a_type=$f ;; label) a_label=$f ;; needs) a_needs=$f ;; path) a_path=$f ;;
+      content) a_content=$f ;; run) a_run=$f ;; reason) reason=$f ;;
+    esac
+    key=""
+  done < "$plan"
+  info "podsumowanie akcji (tryb $mode):"
+  printf '%s' "$summary"
+  [ "$rc" -ne 0 ] && info "UWAGA: część akcji się nie powiodła; log: $log (worktree zostaje)" >&2
+  return "$rc"
 }
 
 # ----------------------------------------------------------------- main -----
