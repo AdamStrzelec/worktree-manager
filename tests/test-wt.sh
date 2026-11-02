@@ -5,6 +5,9 @@ SH=${1:-bash}
 WT_BIN=${WT_BIN:-$(cd "$(dirname "$0")/.." && pwd -P)/bin/wt}
 WT="$SH $WT_BIN"
 PASS=0 FAIL=0
+# Never read the user's real profiles (~/.config/wt/profiles.json): empty config home per run.
+XDG_CONFIG_HOME=$(mktemp -d); export XDG_CONFIG_HOME
+trap 'rm -rf "$XDG_CONFIG_HOME"' EXIT
 
 ok()   { PASS=$((PASS + 1)); printf '  ok   %s\n' "$1"; }
 bad()  { FAIL=$((FAIL + 1)); printf '  FAIL %s\n' "$1"; }
@@ -35,7 +38,7 @@ mkrepo() {
 
 echo "== bash: $SH =="
 R=$(mkrepo)
-trap 'rm -rf "$R"' EXIT
+trap 'rm -rf "$R" "$XDG_CONFIG_HOME"' EXIT
 cd "$R" || exit 1
 
 echo "-- usage"
@@ -1216,6 +1219,11 @@ check_fail "--no-profile nie uruchamia akcji" test -e "$R/.claude/worktrees/np-a
 check_fail "--no-profile z --mode" env XDG_CONFIG_HOME="$PX" $WT new np-b --no-fetch --no-profile --mode f
 git -C "$R" worktree remove --force .claude/worktrees/np-a && git -C "$R" branch -q -D np-a
 rm -rf "$PX"
+
+UT=$(mkrepo); cp -R "$(dirname "$WT_BIN")" "$UT/bin"; printf 'import os\nprint("WT_CMD=" + os.environ["WT_CMD"])\n' > "$UT/bin/wt-ui"
+out=$(cd "$UT" && $SH ./bin/wt ui 2>&1)
+contains "ui: WT_CMD bezwzględny przy ./bin/wt" "$out" "WT_CMD=$(cd "$UT" && pwd -P)/bin/wt"
+rm -rf "$UT"
 
 echo "-- profiles: UI (pty)"
 PX=$(mktemp -d); mkdir -p "$PX/wt"

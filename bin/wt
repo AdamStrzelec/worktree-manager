@@ -884,7 +884,6 @@ cmd_test() {
   top=$(git rev-parse --show-toplevel) || die "nie udało się ustalić korzenia repo"
   run_tests "$top" "$@"
 }
-# cmd_ui - launch the curses UI (bin/wt-ui next to this script, symlinks resolved).
 # script_src - print the real path of this script (symlinks resolved; helpers live next to it).
 script_src() {
   local src=$0 link
@@ -898,13 +897,15 @@ script_src() {
   printf '%s' "$src"
 }
 
+# cmd_ui - launch the curses UI (bin/wt-ui next to this script, symlinks resolved).
+# WT_CMD must be absolute: the UI runs `wt` from other directories (e.g. the main checkout).
 cmd_ui() {
   local src dir
   src=$(script_src)
   dir=$(cd "$(dirname "$src")" && pwd -P)
   [ -f "$dir/wt-ui" ] || die "brak pliku $dir/wt-ui"
   command -v python3 >/dev/null 2>&1 || die "wt ui wymaga python3"
-  WT_CMD="$src" exec python3 "$dir/wt-ui" "$@"
+  WT_CMD="$dir/$(basename "$src")" exec python3 "$dir/wt-ui" "$@"
 }
 
 # Profile files: global defaults and per-repo overrides (both trusted, never committed).
