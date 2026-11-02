@@ -11,6 +11,7 @@ Pełny opis działania, konfiguracji i planów jest w [docs/wt-manager.md](docs/
 | `wt new`, `wt list`, `wt status`, `wt test`, `wt config` (też `set`/`unset`) | gotowe i przetestowane |
 | `wt ui` | gotowe: interfejs w terminalu (wymaga `python3`), testowane tylko ręcznie i pty-smoke |
 | `wt drop` | gotowe i przetestowane (patrz "Usuwanie worktree" niżej) |
+| `wt profiles`, `wt new --mode` | gotowe: profile z trybami i akcjami (pliki, komendy, sesja i okna tmux), patrz "Profile" niżej |
 | `wt merge` | jeszcze niezaimplementowane (komenda zwraca błąd "jeszcze niezaimplementowana"); zmergowanie robi się ręcznie gitem albo przez PR w `wt ui` |
 
 ## Wymagania
@@ -19,6 +20,7 @@ Pełny opis działania, konfiguracji i planów jest w [docs/wt-manager.md](docs/
 - `git` 2.31 lub nowszy (starszy też zadziała dzięki fallbackowi, ale nie był testowany)
 - macOS. Testy przechodziły na macOS (bash 3.2 i bash 5.3). Na Linuksie skrypt nie był jeszcze uruchamiany, więc jego działanie tam nie jest potwierdzone.
 - opcjonalnie `shellcheck` (tylko do rozwijania skryptu) i `tmux`
+- `python3`: dla `wt ui` oraz gdy istnieje plik profili (bez profili `wt new`/`drop` nie potrzebują Pythona)
 
 ## Instalacja
 
@@ -126,7 +128,40 @@ Sprawdzenie, co jest ustawione i skąd pochodzi każda wartość:
 wt config
 ```
 
-Zmiana wartości bez ręcznej edycji pliku (zapis do prywatnego `.git/wt.conf`): `wt config set KLUCZ WARTOŚĆ`, `wt config unset KLUCZ`, albo klawisz `C` w `wt ui`. Hooki `drop` dostają zmienne `WT_NAME`, `WT_PATH`, `WT_BRANCH`, `WT_MAIN`; przepis na sesję tmux jest w [docs/wt-manager.md](docs/wt-manager.md).
+Zmiana wartości bez ręcznej edycji pliku (zapis do prywatnego `.git/wt.conf`): `wt config set KLUCZ WARTOŚĆ`, `wt config unset KLUCZ`, albo klawisz `C` w `wt ui`. Hooki `drop` dostają zmienne `WT_NAME`, `WT_PATH`, `WT_BRANCH`, `WT_MAIN`; sesję tmux na worktree najprościej zrobić profilem (niżej).
+
+## Profile: tryby i akcje przy `wt new`
+
+Profil to plik JSON z trybami (`modes`), akcjami (`actions`), zmiennymi (`variables`) i promptami (`prompts`). Tryb to lista akcji uruchamianych po utworzeniu worktree. Typy akcji:
+
+| Typ | Co robi | Przy `wt drop` |
+| --- | --- | --- |
+| `file` | tworzy plik w worktree (`path`, `content`); nie nadpisuje istniejących, dopisuje do `info/exclude` | znika razem z worktree |
+| `shell` | uruchamia `run` w katalogu worktree | nic |
+| `tmux-session` | sesja `repo/temat` w katalogu worktree (`attach: true` od razu się podłącza) | zamykana (po oknach) |
+| `tmux-window` | okno w tej sesji z komendą `run`; `beforeDrop.sendKeys` wysyłane przed zamknięciem (np. `/exit` dla claude) | zamykane z sesją |
+
+Pliki (oba niewersjonowane, więc mogą zawierać komendy):
+
+- `~/.config/wt/profiles.json`: globalnie, dla wszystkich repo,
+- `<repo>/.git/wt-profiles.json`: nadpisania dla jednego repo (tu zapisuje ekran `P` w `wt ui`).
+
+Projekt nadpisuje globalny plik całymi kluczami (`modes.feature`, `actions.claude` …); `null` usuwa odziedziczony klucz. Gotowy przykład: [examples/profiles.json](examples/profiles.json), pełny opis: [docs/spec-profiles.md](docs/spec-profiles.md).
+
+```bash
+mkdir -p ~/.config/wt && cp examples/profiles.json ~/.config/wt/profiles.json
+wt profiles check                       # walidacja obu plików
+wt profiles                             # tryby, akcje, zmienne i skąd pochodzą
+wt new login --mode review              # tryb inny niż domyślny
+wt new login --set model=sonnet --skip git
+wt new login --no-profile               # sam worktree, profil nie jest czytany
+```
+
+W tekstach działają placeholdery `{name} {branch} {path} {base} {repo} {mode} {session}`, zmienne (`{model}`) i prompty (`{prompt:review}`); w `run` są cytowane dla shella. `needs` wskazuje akcje, od których dana zależy (muszą być wcześniej na liście trybu).
+
+Błędy: zły plik profilu blokuje `wt new`, zanim cokolwiek powstanie. Błąd akcji w trakcie (np. `npm ci`) nie zatrzymuje pozostałych akcji; pomijane są tylko te, które od niej zależą. Worktree zostaje, `wt new` zwraca kod błędu, a podsumowanie trafia do terminala, `<worktree>/.wt-actions` i `.wt-actions.log` oraz do szczegółów worktree w `wt ui`.
+
+W `wt ui`: `n` pyta o tryb i pokazuje akcje do odznaczenia oraz zmienne, `o` → `t` otwiera sesję tmux worktree, `P` edytuje tryb domyślny, wartości zmiennych i akcje trybów. `wt drop` zamyka sesję tmux worktree; odmawia, gdy wywołujesz go z wnętrza tej sesji.
 
 ## Usuwanie worktree i akcje na PR
 

@@ -1026,6 +1026,9 @@ PY
 contains "moduł wt-profiles" "$out" "PROFILES-OK"
 
 echo "-- profiles: wt profiles"
+PX=$(mktemp -d); mkdir -p "$PX/wt"; cp "$(dirname "$WT_BIN")/../examples/profiles.json" "$PX/wt/"
+check "examples/profiles.json przechodzi walidację" sh -c "cd '$R' && XDG_CONFIG_HOME='$PX' $WT profiles check"
+rm -rf "$PX"
 PX=$(mktemp -d)
 out=$(cd "$R" && XDG_CONFIG_HOME="$PX" $WT profiles 2>&1); rc=$?
 [ "$rc" -eq 0 ] && ok "profiles bez plików exit 0" || bad "profiles bez plików exit $rc"

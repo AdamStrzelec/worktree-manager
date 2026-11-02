@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "defaultMode": "feature",
+  "variables": {
+    "model": {
+      "label": "Model Claude",
+      "description": "Model dla sesji claude w oknie tmux",
+      "choices": ["opus", "sonnet"],
+      "default": "opus"
+    }
+  },
+  "modes": {
+    "feature": {
+      "label": "Nowa funkcja",
+      "description": "Zależności, sesja tmux z claude i lazygit",
+      "actions": ["deps", "tmux", "claude", "git"]
+    },
+    "review": {
+      "label": "Przegląd",
+      "description": "Sesja tmux z claude, który przegląda zmiany względem bazy",
+      "actions": ["tmux", "review"]
+    },
+    "bare": {
+      "label": "Sam worktree",
+      "description": "Bez dodatkowych akcji",
+      "actions": []
+    }
+  },
+  "actions": {
+    "deps": {
+      "type": "shell",
+      "label": "Zależności",
+      "description": "npm ci w worktree; błąd nie blokuje pozostałych akcji",
+      "run": "npm ci",
+      "optional": true
+    },
+    "tmux": {
+      "type": "tmux-session",
+      "label": "Sesja tmux",
+      "description": "Sesja {session} w katalogu worktree",
+      "attach": false
+    },
+    "claude": {
+      "type": "tmux-window",
+      "label": "Claude",
+      "description": "Okno z claude (model {model})",
+      "window": "claude",
+      "run": "claude --model {model}",
+      "beforeDrop": { "sendKeys": "/exit" }
+    },
+    "git": {
+      "type": "tmux-window",
+      "label": "Git",
+      "description": "Okno z lazygit",
+      "window": "git",
+      "run": "lazygit",
+      "optional": true
+    },
+    "review": {
+      "type": "tmux-window",
+      "label": "Przegląd zmian",
+      "description": "claude z promptem przeglądu",
+      "window": "review",
+      "run": "claude --model {model} {prompt:review}",
+      "beforeDrop": { "sendKeys": "/exit" }
+    }
+  },
+  "prompts": {
+    "review": "Przejrzyj zmiany na gałęzi {branch} względem {base}."
+  }
+}
